@@ -1,86 +1,55 @@
-# Guia e Histórico da Conversa — Projeto: Rastreador de Preços em Python
+# Guia e Histórico da Conversa — Plataforma Multiusuário de Monitoramento de Preços com WhatsApp
 
-Este documento reúne toda a explicação conceitual, arquitetura e instruções do projeto desenvolvidas durante a nossa conversa.
+Este documento reúne a arquitetura e as instruções atualizadas do projeto, agora com **perfis individuais de usuários**, **isolamento completo de dados**, **exclusão segura de produtos** e **notificações via WhatsApp**.
 
 ---
 
-## 1. Visão Geral do Projeto
+## 1. Visão Geral da Plataforma
 
-O objetivo do sistema é **monitorar produtos na internet automaticamente** para avisar quando o preço atingir ou ficar abaixo do valor que você deseja pagar, sem precisar abrir o site manualmente todos os dias.
+O sistema permite que múltiplas pessoas criem suas próprias contas (perfis individuais), cadastrem os produtos que desejam monitorar de forma 100% isolada e recebam alertas de queda de preço diretamente em seus respectivos números de **WhatsApp**.
 
 ### Fluxo de Funcionamento
 
 ```mermaid
 flowchart LR
-    A[Agendador / Loop] --> B[Scraper / Extrator de Preço]
-    B --> C[(Banco SQLite)]
-    C --> D{Preço <= Alvo?}
-    D -- Sim --> E[Disparador de Notificação: Discord / Telegram]
-    D -- Não --> F[Apenas registra no histórico]
+    U[Usuário faz Login / Cria Perfil] --> P[Gerencia Produtos Isolados]
+    P --> M[Monitor de Preços / Scraper]
+    M --> DB[(SQLite: users, products, price_history, notification_logs)]
+    DB --> C{Preço <= Alvo ou Queda Relevante?}
+    C -- Sim e Não Duplicado --> W[Notificação no WhatsApp do Usuário]
+    C -- Não --> H[Apenas atualiza histórico]
 ```
 
 ---
 
-## 2. Explicação de Cada Módulo do Código
+## 2. Principais Funcionalidades Implementadas
 
-### 1. Extração do Preço (`scraper.py`)
-* **Acessa a página:** Envia uma requisição HTTP para a URL do produto usando cabeçalhos (`User-Agent`) para simular um navegador real e evitar bloqueios simples.
-* **Lê o HTML:** Usa o `BeautifulSoup` para procurar onde o preço está na página (compatível com **Mercado Livre**, **Books to Scrape** e meta tags padrão de e-commerces).
-* **Limpa e converte o dado (`clean_price`):** O preço vem como texto (ex: `"R$ 1.899,90"`). A função remove símbolos de moeda e converte para número decimal do Python (`float`: `1899.90`), permitindo comparações matemáticas.
+### 1. Sistema de Usuários e Perfis Isolados (`database.py` e `app.py`)
+* **Cadastro e Login com Senha Criptografada:** Senhas protegidas com hash `PBKDF2-HMAC-SHA256` e `salt` aleatório.
+* **Isolamento Completo:** Cada produto pertence exclusivamente ao `user_id` que o cadastrou (`UNIQUE(user_id, url)`). Nenhum usuário consegue visualizar, editar ou excluir produtos ou históricos de outra pessoa.
 
-### 2. Armazenamento e Memória (`database.py`)
-Usa o **SQLite** (banco de dados nativo do Python, salvo no arquivo local `prices.db`):
-* **Tabela `products`:** Guarda o nome do produto, link (`url`), preço desejado (`target_price`) e o último preço notificado (`last_notified_price`).
-* **Tabela `price_history`:** Guarda cada leitura de preço junto com a data e hora (`checked_at`), permitindo acompanhar o histórico de variação ao longo do tempo.
+### 2. Notificações Personalizadas via WhatsApp (`notifier.py`)
+* **Número Individual por Perfil:** Cada usuário cadastra e atualiza seu próprio número de WhatsApp na aba **📱 Meu WhatsApp & Perfil**.
+* **Prevenção de Duplicidade:** O sistema registra `last_notified_price` e `last_price`, evitando reenviar alertas repetidos para o mesmo valor.
+* **Modos de Disparo WhatsApp:**
+  * **Automático e Gratuito (CallMeBot API):** Basta o usuário informar sua chave gratuita do CallMeBot no perfil para receber mensagens em segundo plano.
+  * **Gateways / Twilio / Evolution API:** Suporte via variáveis no arquivo `.env`.
+  * **Link Direto (`wa.me`):** Botão de 1 clique no painel para abrir/enviar o alerta formatado diretamente no WhatsApp (iOS, Android ou Web).
 
-### 3. Módulo de Notificação (`notifier.py`)
-* Formata uma mensagem clara com o nome do produto, preço atual, preço-alvo e link direto de compra.
-* Exibe o alerta no terminal e, caso configurado no arquivo `.env`, envia a mensagem diretamente para o seu **Discord** (via Webhook) ou **Telegram** (via Bot).
-
-### 4. Lógica Principal (`main.py`)
-É o cérebro que conecta tudo:
-1. Inicializa o banco de dados (`init_db()`).
-2. Busca todos os produtos cadastrados (`get_all_products()`).
-3. Para cada produto, consulta o preço atual (`fetch_product_info()`), grava no histórico (`record_price()`) e verifica:
-   $$\text{Preço Atual} \le \text{Preço Alvo}$$
-4. Se atingiu a meta (e ainda não notificou por esse valor), dispara o alerta e atualiza o registro.
+### 3. Gerenciamento e Exclusão Segura de Produtos (`app.py` e `database.py`)
+* **Adição e Edição de Preço Alvo:** Cada usuário adiciona produtos à sua lista e pode ajustar o preço desejado a qualquer momento.
+* **Remoção com Confirmação:** Ao clicar em **"🗑️ Parar de Monitorar"**, o sistema solicita confirmação explícita antes de apagar, interrompendo imediatamente o monitoramento e removendo o histórico daquele produto.
 
 ---
 
-## 3. Estrutura de Arquivos
+## 3. Como Atualizar no GitHub e Streamlit Cloud
 
-```text
-rastreador-de-sites/
-├── CONVERSA_E_GUIA.md  # Este resumo completo da nossa conversa e explicação do sistema
-├── database.py         # Criação e operações no banco de dados SQLite (prices.db)
-├── scraper.py          # Extração e limpeza do preço a partir da URL do produto
-├── notifier.py         # Envio de alertas no terminal, Discord e Telegram
-├── main.py             # Orquestrador principal que executa a verificação
-├── requirements.txt    # Lista de bibliotecas Python necessárias
-└── .env.example        # Exemplo de configuração para variáveis do Discord/Telegram
-```
-
----
-
-## 4. Como Executar o Projeto
-
-No terminal, dentro da pasta `rastreador-de-sites`, execute:
+Para enviar esta nova versão para o seu link público do Streamlit Cloud:
 
 ```bash
-# 1. Crie e ative um ambiente virtual
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Instale as dependências
-pip install -r requirements.txt
-
-# 3. Execute o rastreador
-python3 main.py
+cd /Users/paulo/rastreador-de-sites
+git add .
+git commit -m "Adiciona sistema multiusuário, alertas via WhatsApp e exclusão de produtos"
+git push
 ```
-
-### Como configurar alertas no Discord ou Telegram (Opcional)
-1. Faça uma cópia do arquivo `.env.example` com o nome `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-2. Preencha `DISCORD_WEBHOOK_URL` (criado nas configurações do canal do seu servidor Discord) ou `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`.
+*(O Streamlit Cloud detecta o `git push` e atualiza o site automaticamente em poucos segundos!)*
