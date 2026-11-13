@@ -1,0 +1,20 @@
+# Ambiente virtual
+.venv/
+venv/
+ENV/
+
+# Bytecodes e caches do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Banco de dados local e dados temporários
+*.db
+prices.db
+
+# Chaves e segredos (NUNCA subir para o GitHub!)
+.env
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
