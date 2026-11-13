@@ -1,5 +1,18 @@
+from __future__ import annotations
+import importlib
 import streamlit as st
 import pandas as pd
+import database
+import notifier
+import main
+
+# Garante que o Streamlit Cloud atualize os módulos em memória após um git push sem precisar reiniciar o servidor
+if not hasattr(database, "create_user"):
+    importlib.reload(database)
+if not hasattr(notifier, "format_whatsapp_message"):
+    importlib.reload(notifier)
+    importlib.reload(main)
+
 from database import (
     init_db,
     create_user,

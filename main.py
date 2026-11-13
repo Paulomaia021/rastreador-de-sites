@@ -1,3 +1,4 @@
+from __future__ import annotations
 from database import (
     init_db,
     add_product,
