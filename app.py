@@ -3,21 +3,25 @@ import importlib
 import streamlit as st
 import pandas as pd
 import database
+import scraper
 import notifier
 import main
+import admin_panel
 
 # Garante que o Streamlit Cloud atualize os módulos em memória após um git push sem precisar reiniciar o servidor
-if not hasattr(database, "create_user"):
+if not hasattr(database, "admin_get_dashboard_kpis"):
     importlib.reload(database)
-if not hasattr(notifier, "format_whatsapp_message"):
+    importlib.reload(scraper)
     importlib.reload(notifier)
     importlib.reload(main)
+    importlib.reload(admin_panel)
 
 from database import (
     init_db,
     create_user,
     authenticate_user,
     get_user_by_id,
+    is_user_admin,
     update_user_profile,
     add_product,
     get_user_products,
@@ -25,14 +29,13 @@ from database import (
     delete_product,
     get_user_price_history,
     get_user_notifications,
-    normalize_whatsapp_phone,
 )
 from main import check_all_products
 from notifier import (
     format_whatsapp_message,
     generate_whatsapp_link,
-    send_whatsapp_message,
 )
+from admin_panel import render_admin_panel
 
 # 1. Configuração inicial da página
 st.set_page_config(
@@ -73,13 +76,16 @@ def render_auth_screen() -> None:
                 submit_login = st.form_submit_button("Entrar", use_container_width=True)
 
                 if submit_login:
-                    user = authenticate_user(username, password)
-                    if user:
-                        st.session_state["user"] = user
-                        st.session_state["last_alerts"] = []
-                        st.rerun()
-                    else:
-                        st.error("Usuário ou senha incorretos. Verifique seus dados ou crie um perfil.")
+                    try:
+                        user = authenticate_user(username, password)
+                        if user:
+                            st.session_state["user"] = user
+                            st.session_state["last_alerts"] = []
+                            st.rerun()
+                        else:
+                            st.error("Usuário ou senha incorretos. Verifique seus dados ou crie um perfil.")
+                    except PermissionError as err:
+                        st.error(str(err))
 
         with tab_register:
             with st.form("register_form"):
@@ -117,19 +123,22 @@ if not st.session_state["user"]:
     render_auth_screen()
     st.stop()
 
-# Usuário autenticado: recarrega dados frescos do banco garantindo isolamento
+# Usuário autenticado: recarrega dados frescos do banco garantindo isolamento e checando se está ativo
 current_user = get_user_by_id(st.session_state["user"]["id"])
-if not current_user:
+if not current_user or current_user.get("is_active", 1) == 0:
     st.session_state["user"] = None
     st.rerun()
 st.session_state["user"] = current_user
-user_id = current_user["id"]
+user_id = int(current_user["id"])
+user_is_admin = is_user_admin(user_id)
 
 # =====================================================================
 # BARRA LATERAL: PERFIL, CADASTRO DE PRODUTO E LOGOUT
 # =====================================================================
 with st.sidebar:
-    st.markdown(f"### 👤 Olá, {current_user['display_name']}!")
+    role_badge = "👑 Administrador" if user_is_admin else "👤 Conta Pessoal"
+    st.markdown(f"### Olá, {current_user['display_name']}!")
+    st.caption(f"Nível de acesso: **{role_badge}**")
     phone_display = (
         f"+{current_user['whatsapp_phone']}"
         if current_user.get("whatsapp_phone")
@@ -175,7 +184,7 @@ with st.sidebar:
 
 
 # =====================================================================
-# ÁREA PRINCIPAL DIVIDIDA EM ABAS DO PERFIL
+# ÁREA PRINCIPAL DIVIDIDA EM ABAS DO PERFIL (+ ABA EXCLUSIVA DE ADMIN)
 # =====================================================================
 st.title(f"🏷️ Painel de Monitoramento — {current_user['display_name']}")
 
@@ -185,13 +194,23 @@ if not current_user.get("whatsapp_phone"):
         "para receber as atualizações de preço diretamente no seu celular."
     )
 
-tab_produtos, tab_historico, tab_whatsapp = st.tabs(
-    [
-        "📦 Meus Produtos Monitorados",
-        "📈 Histórico & Alertas Enviados",
-        "📱 Meu WhatsApp & Perfil",
-    ]
-)
+tab_titles = [
+    "📦 Meus Produtos Monitorados",
+    "📈 Histórico & Alertas Enviados",
+    "📱 Meu WhatsApp & Perfil",
+]
+if user_is_admin:
+    tab_titles.append("Painel de Administração")
+
+all_tabs = st.tabs(tab_titles)
+tab_produtos = all_tabs[0]
+tab_historico = all_tabs[1]
+tab_whatsapp = all_tabs[2]
+tab_admin = all_tabs[3] if user_is_admin else None
+
+if user_is_admin and tab_admin is not None:
+    with tab_admin:
+        render_admin_panel(current_user)
 
 # ---------------------------------------------------------------------
 # ABA 1: GERENCIAMENTO DE PRODUTOS DO USUÁRIO (ISOLADO + EXCLUSÃO SEGURA)

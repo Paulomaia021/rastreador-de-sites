@@ -11,6 +11,7 @@ __pycache__/
 # Banco de dados local e dados temporários
 *.db
 prices.db
+backups/
 
 # Chaves e segredos (NUNCA subir para o GitHub!)
 .env
