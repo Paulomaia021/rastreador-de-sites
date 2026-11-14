@@ -740,22 +740,21 @@ def reset_password_with_token(user_id: int, code: str, new_password: str) -> boo
 
 
 # =====================================================================
-# SESSÕES PERSISTENTES COM PRAZO DE EXPIRAÇÃO (LOGIN PERMANENTE)
+# SESSÕES PERSISTENTES (LOGIN PERMANENTE SEM DESLOGAR)
 # =====================================================================
 
-def create_user_session(user_id: int, duration_days: int = 14) -> str:
+def create_user_session(user_id: int, duration_days: int | None = None) -> str:
     """
-    Gera um token seguro de sessão (UUID4) com prazo de validade configurável (padrão: 14 dias),
-    armazena no banco e retorna o token para persistência de login no navegador.
+    Gera um token seguro de sessão (UUID4) permanente (sem expiração por padrão),
+    mantendo o usuário logado mesmo ao atualizar a página ou após semanas offline.
+    O login só é encerrado se o usuário clicar explicitamente em 'Sair da Conta'.
     """
     token = uuid.uuid4().hex
     now = datetime.now()
-    expires = (now + timedelta(days=duration_days)).isoformat(timespec="seconds")
     now_str = now.isoformat(timespec="seconds")
+    expires = (now + timedelta(days=duration_days)).isoformat(timespec="seconds") if duration_days else ""
 
     with get_connection() as conn:
-        # Limpa sessões expiradas antes de criar a nova
-        conn.execute("DELETE FROM user_sessions WHERE expires_at < ?", (now_str,))
         conn.execute(
             """
             INSERT INTO user_sessions (session_token, user_id, expires_at, created_at)
@@ -768,9 +767,9 @@ def create_user_session(user_id: int, duration_days: int = 14) -> str:
 
 def get_user_from_session_token(token: str) -> dict | None:
     """
-    Valida um token de sessão salvo. Se o token for válido, não tiver expirado
-    e a conta de usuário estiver ativa, retorna os dados do usuário.
-    Caso contrário, limpa o token expirado e retorna None.
+    Valida um token de sessão salvo. Se o token for válido e a conta de usuário estiver ativa,
+    retorna os dados do usuário. Se expires_at for definido e expirado, invalida a sessão.
+    Nenhuma conta de usuário é afetada ou excluída.
     """
     if not token or not isinstance(token, str):
         return None
@@ -794,12 +793,12 @@ def get_user_from_session_token(token: str) -> dict | None:
         if not row:
             return None
 
-        # Verifica se expirou
-        if row["expires_at"] < now_str:
+        # Se houver prazo configurado e tiver expirado
+        if row["expires_at"] and row["expires_at"] < now_str:
             conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
             return None
 
-        # Verifica se a conta do usuário foi desativada
+        # Verifica se a conta do usuário foi desativada pelo administrador
         if row["is_active"] == 0:
             conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
             return None

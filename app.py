@@ -99,7 +99,7 @@ def render_auth_screen() -> None:
                     try:
                         user = authenticate_user(username, password)
                         if user:
-                            token = create_user_session(user["id"], duration_days=14)
+                            token = create_user_session(user["id"])
                             st.query_params["session_token"] = token
                             st.session_state["user"] = user
                             st.session_state["last_alerts"] = []
@@ -133,7 +133,7 @@ def render_auth_screen() -> None:
                                 display_name=new_display_name,
                                 whatsapp_phone=new_whatsapp,
                             )
-                            token = create_user_session(created["id"], duration_days=14)
+                            token = create_user_session(created["id"])
                             st.query_params["session_token"] = token
                             st.session_state["user"] = created
                             st.success("Perfil criado com sucesso!")
@@ -255,7 +255,6 @@ with st.sidebar:
         else "⚠️ Não configurado"
     )
     st.caption(f"📱 WhatsApp ativo: **{phone_display}**")
-    st.caption("🔒 *Login salvo (14 dias de validade)*")
 
     if st.button("🚪 Sair da Conta", use_container_width=True):
         current_token = st.query_params.get("session_token")
