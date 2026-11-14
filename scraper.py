@@ -3,7 +3,7 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
-from database import extract_store_name
+from database import extract_store_name, validate_product_url
 
 
 # Cabeçalhos para simular um navegador real e evitar bloqueios simples
@@ -26,37 +26,113 @@ class ScraperError(Exception):
         self.response_time_ms = response_time_ms
 
 
+_HTTP_SESSION: requests.Session | None = None
+
+
+def _get_http_session() -> requests.Session:
+    """Reutiliza conexões TCP/TLS via requests.Session com cabeçalhos padrão."""
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        _HTTP_SESSION = session
+    return _HTTP_SESSION
+
+
 def clean_price(price_text: str) -> float:
     """
-    Transforma textos como 'R$ 1.899,90' ou '£51.77' em float (1899.90 ou 51.77).
+    Transforma textos como 'R$ 1.899,90', 'R$ 1.299', 'De R$ 250,00 por R$ 199,90'
+    ou '£51.77' em float positivo (1899.90, 1299.0, 199.90, 51.77).
     """
-    cleaned = re.sub(r"[^\d.,]", "", price_text.strip())
-
-    if not cleaned:
+    if not price_text or not isinstance(price_text, str):
         raise ValueError(f"Não foi possível extrair números de: '{price_text}'")
 
+    raw = price_text.strip()
+    if not raw:
+        raise ValueError(f"Não foi possível extrair números de: '{price_text}'")
+
+    # Rejeita valores explicitamente negativos (ex: "-R$ 10,00" ou "-10.00")
+    if re.match(r"^\s*-\s*(?:R\$|\$|£|€)?\s*\d", raw):
+        raise ValueError(f"Preço negativo não é permitido: '{price_text}'")
+
+    # 1. Trata padrão promocional "De X por Y" priorizando o preço final Y
+    de_por_match = re.search(
+        r"(?i)\bde\s+(?:R\$|\$|£|€)?\s*\d+(?:[.,]\d+)*\s+por\s+((?:R\$|\$|£|€)?\s*\d+(?:[.,]\d+)*)",
+        raw,
+    )
+    if de_por_match:
+        raw = de_por_match.group(1)
+    else:
+        # 2. Remove trechos de parcelamento (ex: "em até 10x de R$ 199,90") quando há preço principal antes
+        raw_no_installments = re.sub(
+            r"(?i)(?:em\s+at[eé]\s+)?\b\d{1,2}\s*x\s*(?:de\s*)?(?:R\$|\$|£|€)?\s*\d+(?:[.,]\d+)*.*$",
+            "",
+            raw,
+        ).strip()
+        if re.search(r"\d", raw_no_installments):
+            raw = raw_no_installments
+
+    # 3. Extrai o primeiro token numérico bem formado (ex: "1.899,90", "1.299", "51.77")
+    tokens = re.findall(r"\d+(?:[.,]\d+)*", raw)
+    if not tokens:
+        raise ValueError(f"Não foi possível extrair números de: '{price_text}'")
+
+    cleaned = tokens[0]
+
+    # 4. Normaliza separadores de milhar e decimal com precisão para formato BR e internacional
     if "," in cleaned and "." in cleaned:
         if cleaned.rfind(",") > cleaned.rfind("."):
+            # Formato BR/Europeu: 1.899,90 ou 1.299.000,90
             cleaned = cleaned.replace(".", "").replace(",", ".")
         else:
+            # Formato US/UK: 1,899.90
             cleaned = cleaned.replace(",", "")
     elif "," in cleaned:
-        cleaned = cleaned.replace(",", ".")
+        if cleaned.count(",") > 1:
+            # Múltiplas vírgulas como separador de milhar: 1,299,000
+            cleaned = cleaned.replace(",", "")
+        else:
+            parts = cleaned.split(",")
+            # Ex: US$ 1,299 (sem centavos e com símbolo internacional) vs R$ 1,99 / 199,90
+            if len(parts[1]) == 3 and ("US$" in raw or "£" in raw) and "R$" not in raw:
+                cleaned = cleaned.replace(",", "")
+            else:
+                cleaned = cleaned.replace(",", ".")
+    elif "." in cleaned:
+        if cleaned.count(".") > 1:
+            # Múltiplos pontos como separador de milhar: 1.299.000
+            cleaned = cleaned.replace(".", "")
+        else:
+            parts = cleaned.split(".")
+            # Se houver exatamente 3 dígitos após o único ponto (ex: "R$ 1.299" ou "1.299"),
+            # trata-se de separador de milhar brasileiro (preços reais não usam 3 casas decimais)
+            if len(parts[1]) == 3:
+                cleaned = cleaned.replace(".", "")
 
-    return float(cleaned)
+    value = round(float(cleaned), 2)
+    if value <= 0:
+        raise ValueError(f"Preço inválido ou zerado ({value}) extraído de: '{price_text}'")
+
+    return value
 
 
 def fetch_product_info(url: str) -> dict:
     """
-    Acessa a página do produto e retorna um dicionário com título, preço,
+    Valida a URL, acessa a página do produto e retorna um dicionário com título, preço,
     loja, código HTTP e tempo de resposta em milissegundos.
     """
+    try:
+        clean_url = validate_product_url(url)
+    except ValueError as err:
+        raise ScraperError(str(err), http_status=None, response_time_ms=0.0) from err
+
     start_ts = time.perf_counter()
     http_status = None
-    store_name = extract_store_name(url)
+    store_name = extract_store_name(clean_url)
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        session = _get_http_session()
+        response = session.get(clean_url, headers=HEADERS, timeout=15)
         elapsed_ms = round((time.perf_counter() - start_ts) * 1000.0, 2)
         http_status = response.status_code
         response.raise_for_status()

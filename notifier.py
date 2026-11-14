@@ -378,6 +378,36 @@ def send_notification(
     return result
 
 
+def send_recovery_code_whatsapp(rec_info: dict) -> dict:
+    """
+    Envia o código de recuperação de 6 dígitos diretamente pelo backend via WhatsApp,
+    garantindo que o código NUNCA seja exposto em URLs no navegador (wa.me/?text=...).
+    """
+    display_name = rec_info.get("display_name") or rec_info.get("username") or "Usuário"
+    phone = rec_info.get("whatsapp_phone", "")
+    code = rec_info.get("code", "")
+    user_apikey = rec_info.get("whatsapp_apikey", "")
+    user_id = rec_info.get("user_id")
+
+    recovery_msg = (
+        f"🔐 *Recuperação de Conta — Rastreador de Preços*\n\n"
+        f"Olá, *{display_name}*!\n"
+        f"Seu código de segurança para redefinir sua senha é:\n\n"
+        f"👉 *{code}*\n\n"
+        f"Este código expira em 15 minutos. Se você não solicitou, ignore esta mensagem."
+    )
+
+    res = send_whatsapp_message(
+        phone=phone,
+        message=recovery_msg,
+        user_apikey=user_apikey,
+        user_id=user_id,
+    )
+    # Remove qualquer URL externa que possa conter o código de segurança na query string
+    res["whatsapp_url"] = ""
+    return res
+
+
 def admin_retry_notification(admin_user_id: int, notification_id: int) -> dict:
     """
     Permite ao administrador reenviar uma notificação com falha ou pendente,

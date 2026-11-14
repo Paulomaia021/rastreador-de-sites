@@ -18,7 +18,8 @@ if not hasattr(main, "trigger_background_queue_worker"):
     importlib.reload(main)
 
 import admin_panel
-importlib.reload(admin_panel)
+if not hasattr(admin_panel, "render_admin_panel"):
+    importlib.reload(admin_panel)
 
 from database import (
     init_db,
@@ -36,6 +37,7 @@ from database import (
     create_user_session,
     get_user_from_session_token,
     delete_user_session,
+    MIN_PASSWORD_LENGTH,
 )
 from main import check_all_products
 from notifier import (
@@ -90,6 +92,9 @@ def render_auth_screen() -> None:
         )
 
         with tab_login:
+            if st.session_state.get("pwd_reset_success_msg"):
+                st.success(st.session_state.pop("pwd_reset_success_msg"))
+
             if not st.session_state.get("show_forgot_password", False):
                 with st.form("login_form"):
                     st.subheader("Acessar meu painel")
@@ -99,7 +104,8 @@ def render_auth_screen() -> None:
 
                     if submit_login:
                         try:
-                            user = authenticate_user(username, password)
+                            with st.spinner("Autenticando suas credenciais..."):
+                                user = authenticate_user(username, password)
                             if user:
                                 token = create_user_session(user["id"])
                                 st.query_params["session_token"] = token
@@ -118,8 +124,8 @@ def render_auth_screen() -> None:
             else:
                 st.subheader("🔄 Recuperar Minha Senha")
                 st.caption(
-                    "Informe seu nome de usuário ou WhatsApp cadastrado. "
-                    "Enviaremos um código de verificação de 6 dígitos para o seu WhatsApp."
+                    "Informe seu nome de usuário e confirme o número de WhatsApp cadastrado na conta "
+                    "para receber o código de verificação de 6 dígitos (válido por 15 minutos)."
                 )
 
                 if "recovery_data" not in st.session_state:
@@ -128,73 +134,88 @@ def render_auth_screen() -> None:
                 # Passo 1: Solicitar código
                 with st.form("request_code_form"):
                     rec_identifier = st.text_input(
-                        "Seu Usuário ou WhatsApp cadastrado",
-                        placeholder="Ex: paulo ou 21999998888",
+                        "Seu Nome de Usuário",
+                        placeholder="Ex: paulo",
                     )
-                    btn_send_code = st.form_submit_button("📲 Gerar Código de Recuperação", use_container_width=True)
+                    rec_confirm_phone = st.text_input(
+                        "Confirme seu WhatsApp cadastrado (com DDD ou últimos 4 dígitos)",
+                        placeholder="Ex: 21999998888 ou 8888",
+                    )
+                    btn_send_code = st.form_submit_button("📲 Solicitar Código de Recuperação", use_container_width=True)
 
                     if btn_send_code:
-                        if not rec_identifier.strip():
-                            st.warning("Informe seu nome de usuário ou número de WhatsApp.")
+                        if not rec_identifier.strip() or not rec_confirm_phone.strip():
+                            st.warning("Informe seu nome de usuário e confirme o WhatsApp cadastrado.")
                         else:
                             from database import create_recovery_token
+                            from notifier import send_recovery_code_whatsapp
                             try:
-                                rec_info = create_recovery_token(rec_identifier.strip())
+                                with st.spinner("Validando conta e enviando código de verificação..."):
+                                    rec_info = create_recovery_token(
+                                        rec_identifier.strip(),
+                                        confirm_phone=rec_confirm_phone.strip(),
+                                    )
+                                    dispatch_res = send_recovery_code_whatsapp(rec_info)
+                                rec_info["dispatch_method"] = dispatch_res.get("method", "")
+                                rec_info["dispatch_status"] = dispatch_res.get("delivery_status", "")
                                 st.session_state["recovery_data"] = rec_info
-                                st.success(
-                                    f"Código de 6 dígitos gerado com sucesso para a conta de "
-                                    f"**{rec_info['display_name']}**!"
-                                )
                                 st.rerun()
                             except Exception as err:
                                 st.error(str(err))
 
-                # Se código foi gerado, exibe botão de envio e formulário de redefinição
+                # Passo 2: Validar código e definir nova senha
                 if st.session_state.get("recovery_data"):
                     rec_info = st.session_state["recovery_data"]
-                    rec_phone = rec_info["whatsapp_phone"]
-                    rec_code = rec_info["code"]
-
-                    recovery_msg = (
-                        f"🔐 *Recuperação de Conta — Rastreador de Preços*\n\n"
-                        f"Olá, *{rec_info['display_name']}*!\n"
-                        f"Seu código de segurança para redefinir sua senha é:\n\n"
-                        f"👉 *{rec_code}*\n\n"
-                        f"Este código expira em 15 minutos. Se você não solicitou, ignore esta mensagem."
-                    )
-                    wa_rec_link = generate_whatsapp_link(rec_phone, recovery_msg)
+                    masked_phone = rec_info.get("masked_phone", "***")
+                    dispatch_method = rec_info.get("dispatch_method", "")
 
                     st.markdown("---")
-                    st.info(f"📱 Destino WhatsApp: **+{rec_phone}**")
-                    st.link_button(
-                        "📲 Enviar Código para Meu WhatsApp",
-                        wa_rec_link,
-                        type="primary",
-                        use_container_width=True,
-                    )
+                    if dispatch_method in ("twilio_whatsapp", "meta_whatsapp", "whatsapp_gateway", "callmebot_api"):
+                        st.success(
+                            f"📲 Código de 6 dígitos enviado diretamente para o seu WhatsApp (**{masked_phone}**)."
+                        )
+                    else:
+                        st.info(
+                            f"📱 Identidade confirmada para **{masked_phone}**. "
+                            f"Use o código temporário de verificação (válido por 15 min): **`{rec_info['code']}`**"
+                        )
 
-                    # Formulário para digitar código e nova senha
                     with st.form("submit_new_password_form"):
-                        st.markdown("#### Digite o código recebido e sua nova senha")
+                        st.markdown("#### Passo 2: Digite o código de 6 dígitos e sua nova senha")
                         code_input = st.text_input("Código de 6 dígitos", placeholder="Ex: 123456", max_chars=6)
-                        new_pwd1 = st.text_input("Nova Senha", type="password", placeholder="Mínimo 4 caracteres")
-                        new_pwd2 = st.text_input("Confirme a Nova Senha", type="password")
-                        btn_confirm_reset = st.form_submit_button("✅ Redefinir Senha e Entrar", use_container_width=True)
+                        new_pwd1 = st.text_input(
+                            f"Nova Senha (mínimo {MIN_PASSWORD_LENGTH} caracteres)",
+                            type="password",
+                            placeholder=f"Mínimo {MIN_PASSWORD_LENGTH} caracteres",
+                        )
+                        new_pwd2 = st.text_input(
+                            "Confirme a Nova Senha",
+                            type="password",
+                            placeholder="Repita a nova senha",
+                        )
+                        btn_confirm_reset = st.form_submit_button("✅ Redefinir Senha", type="primary", use_container_width=True)
 
                         if btn_confirm_reset:
-                            if new_pwd1 != new_pwd2:
+                            if not code_input.strip():
+                                st.warning("Informe o código de verificação de 6 dígitos.")
+                            elif len(new_pwd1.strip()) < MIN_PASSWORD_LENGTH:
+                                st.error(f"A nova senha deve ter pelo menos {MIN_PASSWORD_LENGTH} caracteres.")
+                            elif new_pwd1 != new_pwd2:
                                 st.error("As senhas digitadas não coincidem. Tente novamente.")
                             else:
                                 from database import reset_password_with_token
                                 try:
-                                    reset_password_with_token(
-                                        user_id=rec_info["user_id"],
-                                        code=code_input,
-                                        new_password=new_pwd1,
-                                    )
+                                    with st.spinner("Validando código e atualizando sua senha..."):
+                                        reset_password_with_token(
+                                            user_id=rec_info["user_id"],
+                                            code=code_input,
+                                            new_password=new_pwd1,
+                                        )
                                     st.session_state["recovery_data"] = None
                                     st.session_state["show_forgot_password"] = False
-                                    st.success("🎉 Senha alterada com sucesso! Você já pode entrar com sua nova senha.")
+                                    st.session_state["pwd_reset_success_msg"] = (
+                                        "🎉 Senha alterada com sucesso! Você já pode entrar com sua nova senha."
+                                    )
                                     st.rerun()
                                 except Exception as err:
                                     st.error(str(err))
@@ -210,7 +231,16 @@ def render_auth_screen() -> None:
                 st.subheader("Criar novo perfil individual")
                 new_display_name = st.text_input("Seu Nome", placeholder="Ex: Paulo Maia")
                 new_username = st.text_input("Nome de Usuário (para login)", placeholder="Ex: paulo")
-                new_password = st.text_input("Crie uma Senha", type="password")
+                new_password = st.text_input(
+                    f"Crie uma Senha (mínimo {MIN_PASSWORD_LENGTH} caracteres)",
+                    type="password",
+                    placeholder=f"Mínimo {MIN_PASSWORD_LENGTH} caracteres",
+                )
+                new_password_confirm = st.text_input(
+                    "Confirme sua Senha",
+                    type="password",
+                    placeholder="Digite a mesma senha novamente",
+                )
                 new_whatsapp = st.text_input(
                     "Seu WhatsApp (com DDD)",
                     placeholder="Ex: 21999998888",
@@ -221,15 +251,20 @@ def render_auth_screen() -> None:
                 if submit_register:
                     if not new_username.strip() or not new_password.strip():
                         st.warning("Preencha pelo menos o nome de usuário e a senha.")
+                    elif len(new_password.strip()) < MIN_PASSWORD_LENGTH:
+                        st.error(f"A senha deve ter pelo menos {MIN_PASSWORD_LENGTH} caracteres.")
+                    elif new_password != new_password_confirm:
+                        st.error("As senhas informadas não coincidem. Digite a mesma senha nos dois campos.")
                     else:
                         try:
-                            created = create_user(
-                                username=new_username,
-                                password=new_password,
-                                display_name=new_display_name,
-                                whatsapp_phone=new_whatsapp,
-                            )
-                            token = create_user_session(created["id"])
+                            with st.spinner("Criando seu perfil seguro..."):
+                                created = create_user(
+                                    username=new_username,
+                                    password=new_password,
+                                    display_name=new_display_name,
+                                    whatsapp_phone=new_whatsapp,
+                                )
+                                token = create_user_session(created["id"])
                             st.query_params["session_token"] = token
                             st.session_state["user"] = created
                             st.success("Perfil criado com sucesso!")
@@ -297,12 +332,13 @@ with st.sidebar:
         if submit_prod:
             if nome.strip() and url.strip() and alvo > 0:
                 try:
-                    add_product(
-                        name=nome.strip(),
-                        url=url.strip(),
-                        target_price=float(alvo),
-                        user_id=user_id,
-                    )
+                    with st.spinner("Validando link e salvando produto no seu perfil..."):
+                        add_product(
+                            name=nome.strip(),
+                            url=url.strip(),
+                            target_price=float(alvo),
+                            user_id=user_id,
+                        )
                     st.success(f"'{nome}' adicionado à sua lista!")
                     st.rerun()
                 except Exception as e:
@@ -341,7 +377,7 @@ if user_is_admin and tab_admin is not None:
         render_admin_panel(current_user)
 
 # ---------------------------------------------------------------------
-# ABA 1: GERENCIAMENTO DE PRODUTOS DO USUÁRIO (ISOLADO + EXCLUSÃO SEGURA)
+# ABA 1: GERENCIAMENTO DE PRODUTOS DO USUÁRIO (ISOLADO + PAGINAÇÃO + EXCLUSÃO SEGURA)
 # ---------------------------------------------------------------------
 with tab_produtos:
     col_title, col_action = st.columns([3, 1])
@@ -376,7 +412,63 @@ with tab_produtos:
             "Use o formulário **'➕ Adicionar Produto'** na barra lateral!"
         )
     else:
-        for prod in produtos:
+        col_search, col_page_size = st.columns([3, 1])
+        with col_search:
+            user_search_q = st.text_input(
+                "🔍 Filtrar meus produtos por nome ou loja",
+                placeholder="Digite para filtrar...",
+                key="user_prod_search",
+            )
+        with col_page_size:
+            items_per_page = st.selectbox(
+                "Itens por página",
+                options=[5, 10, 20, 50],
+                index=1,
+                key="user_prod_page_size",
+            )
+
+        if user_search_q.strip():
+            q_low = user_search_q.strip().lower()
+            filtered_produtos = [
+                p
+                for p in produtos
+                if q_low in (p.get("name") or "").lower()
+                or q_low in (p.get("store_name") or "").lower()
+                or q_low in (p.get("url") or "").lower()
+            ]
+        else:
+            filtered_produtos = produtos
+
+        total_items = len(filtered_produtos)
+        total_pages = max((total_items + items_per_page - 1) // items_per_page, 1)
+
+        if "user_prod_page" not in st.session_state:
+            st.session_state["user_prod_page"] = 1
+        if st.session_state["user_prod_page"] > total_pages:
+            st.session_state["user_prod_page"] = total_pages
+
+        current_page = int(st.session_state["user_prod_page"])
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = min(start_idx + items_per_page, total_items)
+        paginated_produtos = filtered_produtos[start_idx:end_idx]
+
+        if total_items > items_per_page:
+            nav_prev, nav_info, nav_next = st.columns([1, 2, 1])
+            with nav_prev:
+                if st.button("⬅️ Página Anterior", disabled=(current_page <= 1), use_container_width=True):
+                    st.session_state["user_prod_page"] = current_page - 1
+                    st.rerun()
+            with nav_info:
+                st.caption(
+                    f"Página **{current_page}** de **{total_pages}** "
+                    f"(exibindo {start_idx + 1}–{end_idx} de {total_items} produtos)"
+                )
+            with nav_next:
+                if st.button("Próxima Página ➡️", disabled=(current_page >= total_pages), use_container_width=True):
+                    st.session_state["user_prod_page"] = current_page + 1
+                    st.rerun()
+
+        for prod in paginated_produtos:
             pid = prod["id"]
             pname = prod["name"]
             purl = prod["url"]
@@ -556,17 +648,21 @@ with tab_whatsapp:
 
         save_profile = st.form_submit_button("💾 Salvar Configurações de WhatsApp", type="primary")
         if save_profile:
-            updated = update_user_profile(
-                user_id=user_id,
-                display_name=edit_name,
-                whatsapp_phone=edit_phone,
-                whatsapp_apikey=edit_apikey,
-                notifications_enabled=edit_enabled,
-                notify_on_any_drop=edit_any_drop,
-            )
-            st.session_state["user"] = updated
-            st.success("✅ Suas configurações de WhatsApp foram atualizadas com sucesso!")
-            st.rerun()
+            try:
+                with st.spinner("Salvando suas preferências de WhatsApp..."):
+                    updated = update_user_profile(
+                        user_id=user_id,
+                        display_name=edit_name,
+                        whatsapp_phone=edit_phone,
+                        whatsapp_apikey=edit_apikey,
+                        notifications_enabled=edit_enabled,
+                        notify_on_any_drop=edit_any_drop,
+                    )
+                st.session_state["user"] = updated
+                st.success("✅ Suas configurações de WhatsApp foram atualizadas com sucesso!")
+                st.rerun()
+            except ValueError as err:
+                st.error(str(err))
 
     st.divider()
     st.markdown("#### 🧪 Testar Notificação no Meu WhatsApp")

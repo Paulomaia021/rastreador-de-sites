@@ -37,6 +37,8 @@ from database import (
     admin_list_backups,
     admin_restore_backup,
     admin_export_data,
+    cleanup_old_logs,
+    MIN_PASSWORD_LENGTH,
 )
 from main import (
     trigger_background_queue_worker,
@@ -48,6 +50,46 @@ from notifier import (
     admin_retry_notification,
     generate_whatsapp_link,
 )
+
+
+def _paginate_list(items: list, key_prefix: str, default_page_size: int = 20) -> list:
+    """Renderiza controles de paginação para listas e tabelas administrativas extensas."""
+    total = len(items)
+    if total <= default_page_size:
+        return items
+
+    page_key = f"{key_prefix}_page"
+    size_key = f"{key_prefix}_size"
+
+    c_prev, c_info, c_size, c_next = st.columns([1, 2, 1, 1])
+    with c_size:
+        page_size = st.selectbox(
+            "Por página",
+            options=[10, 20, 50, 100],
+            index=1 if default_page_size == 20 else 0,
+            key=size_key,
+            label_visibility="collapsed",
+        )
+
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    cur_page = min(max(int(st.session_state.get(page_key, 1)), 1), total_pages)
+    st.session_state[page_key] = cur_page
+
+    start = (cur_page - 1) * page_size
+    end = min(start + page_size, total)
+
+    with c_prev:
+        if st.button("⬅️ Anterior", key=f"{key_prefix}_prev", disabled=(cur_page <= 1), use_container_width=True):
+            st.session_state[page_key] = cur_page - 1
+            st.rerun()
+    with c_info:
+        st.caption(f"Página **{cur_page}/{total_pages}** ({start + 1}–{end} de {total})")
+    with c_next:
+        if st.button("Próxima ➡️", key=f"{key_prefix}_next", disabled=(cur_page >= total_pages), use_container_width=True):
+            st.session_state[page_key] = cur_page + 1
+            st.rerun()
+
+    return items[start:end]
 
 
 def render_admin_panel(current_user: dict) -> None:
@@ -200,7 +242,7 @@ def render_admin_panel(current_user: dict) -> None:
                     "Nova senha temporária",
                     type="password",
                     key=f"admin_reset_pwd_{sel_uid}",
-                    placeholder="Mínimo 4 caracteres",
+                    placeholder=f"Mínimo {MIN_PASSWORD_LENGTH} caracteres",
                 )
                 if st.button("Salvar Nova Senha", key=f"btn_reset_pwd_{sel_uid}", use_container_width=True):
                     try:
@@ -324,6 +366,7 @@ def render_admin_panel(current_user: dict) -> None:
             )
 
         if all_prods:
+            paged_prods = _paginate_list(all_prods, key_prefix="adm_prods", default_page_size=20)
             df_global_prods = pd.DataFrame(
                 [
                     {
@@ -340,7 +383,7 @@ def render_admin_panel(current_user: dict) -> None:
                         "Duplicado?": f"🔁 Sim ({p['duplicate_count']} perfis)" if p.get("is_duplicate") else "Não",
                         "Link": p.get("url", ""),
                     }
-                    for p in all_prods
+                    for p in paged_prods
                 ]
             )
             st.dataframe(
@@ -589,6 +632,7 @@ def render_admin_panel(current_user: dict) -> None:
                     f"⚠️ Foram identificadas **{len(invalid_phones)}** notificação(ões) com número de WhatsApp ausente ou inválido."
                 )
 
+            paged_notifs = _paginate_list(notifs, key_prefix="adm_notifs", default_page_size=20)
             df_notifs = pd.DataFrame(
                 [
                     {
@@ -605,7 +649,7 @@ def render_admin_panel(current_user: dict) -> None:
                         "Tentativas": n.get("retry_count", 0),
                         "Erro da API": n.get("error_message") or "-",
                     }
-                    for n in notifs
+                    for n in paged_notifs
                 ]
             )
             st.dataframe(df_notifs, use_container_width=True, hide_index=True)
@@ -622,7 +666,8 @@ def render_admin_panel(current_user: dict) -> None:
             with cn1:
                 if st.button("🚀 Reenviar Notificação Agora", key=f"btn_retry_notif_{sel_n['id']}", use_container_width=True):
                     try:
-                        res = admin_retry_notification(admin_id, int(sel_n["id"]))
+                        with st.spinner("Reenviando notificação via WhatsApp..."):
+                            res = admin_retry_notification(admin_id, int(sel_n["id"]))
                         st.success(f"Reenvio processado! Novo status: {res['delivery_status']} ({res['detail']})")
                         st.rerun()
                     except Exception as err:
@@ -660,9 +705,10 @@ def render_admin_panel(current_user: dict) -> None:
                 status_filter=sel_ev_status,
                 user_filter=user_filter_map[sel_ev_user],
                 date_filter=sel_ev_date,
-                limit=100,
+                limit=200,
             )
             if sys_logs:
+                paged_slogs = _paginate_list(sys_logs, key_prefix="adm_slogs", default_page_size=20)
                 df_slogs = pd.DataFrame(
                     [
                         {
@@ -678,7 +724,7 @@ def render_admin_panel(current_user: dict) -> None:
                             "URL Consultada": l.get("url") or "-",
                             "Mensagem / Diagnóstico": l.get("message") or "",
                         }
-                        for l in sys_logs
+                        for l in paged_slogs
                     ]
                 )
                 st.dataframe(df_slogs, use_container_width=True, hide_index=True)
@@ -712,9 +758,10 @@ def render_admin_panel(current_user: dict) -> None:
                 admin_user_id=admin_id,
                 action_filter=sel_aud_action,
                 date_filter=sel_aud_date,
-                limit=100,
+                limit=200,
             )
             if aud_logs:
+                paged_alogs = _paginate_list(aud_logs, key_prefix="adm_alogs", default_page_size=20)
                 df_alogs = pd.DataFrame(
                     [
                         {
@@ -725,7 +772,7 @@ def render_admin_panel(current_user: dict) -> None:
                             "Usuário Alvo ID": a.get("target_user_id") or "-",
                             "Detalhes da Operação": a["details"],
                         }
-                        for a in aud_logs
+                        for a in paged_alogs
                     ]
                 )
                 st.dataframe(df_alogs, use_container_width=True, hide_index=True)
@@ -765,6 +812,13 @@ def render_admin_panel(current_user: dict) -> None:
                     value=float(cur_settings.get("delay_between_requests_sec", "1.0") or 1.0),
                     step=0.5,
                 )
+                retention_days_val = st.number_input(
+                    "Retenção de logs e histórico de fila (dias)",
+                    min_value=7,
+                    max_value=365,
+                    value=int(cur_settings.get("log_retention_days", "90") or 90),
+                    step=15,
+                )
                 save_global_cfg = st.form_submit_button("💾 Salvar Configurações Globais", type="primary")
                 if save_global_cfg:
                     admin_update_system_settings(
@@ -773,9 +827,11 @@ def render_admin_panel(current_user: dict) -> None:
                             "check_interval_minutes": str(interval_min),
                             "max_retries": str(max_retries_val),
                             "delay_between_requests_sec": str(delay_req_val),
+                            "log_retention_days": str(retention_days_val),
                         },
                     )
-                    st.success("Configurações globais salvas com sucesso!")
+                    cleanup_old_logs(int(retention_days_val))
+                    st.success("Configurações globais e política de retenção salvas com sucesso!")
                     st.rerun()
 
         with col_int:
@@ -794,7 +850,8 @@ def render_admin_panel(current_user: dict) -> None:
             )
 
             if st.button("📦 Gerar Novo Backup do Banco SQLite Agora", type="primary", use_container_width=True):
-                bkp_info = admin_create_backup(admin_id)
+                with st.spinner("Gerando snapshot consistente do banco de dados..."):
+                    bkp_info = admin_create_backup(admin_id)
                 st.success(
                     f"Backup '{bkp_info['filename']}' criado com sucesso ({bkp_info['size_bytes']} bytes)!"
                 )
@@ -829,7 +886,8 @@ def render_admin_panel(current_user: dict) -> None:
                     with rc1:
                         if st.button("✅ Confirmar Restauração", type="primary", use_container_width=True):
                             try:
-                                admin_restore_backup(admin_id, sel_bkp_file)
+                                with st.spinner("Validando integridade e restaurando banco de dados..."):
+                                    admin_restore_backup(admin_id, sel_bkp_file)
                                 st.session_state["admin_confirm_restore"] = None
                                 st.success("Banco de dados restaurado com segurança!")
                                 st.rerun()

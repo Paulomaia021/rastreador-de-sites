@@ -1,10 +1,13 @@
 from __future__ import annotations
 import csv
 import hashlib
+import hmac
 import io
+import ipaddress
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import uuid
@@ -15,11 +18,29 @@ from urllib.parse import urlparse
 DB_PATH = Path(__file__).parent / "prices.db"
 BACKUP_DIR = Path(__file__).parent / "backups"
 
+MIN_PASSWORD_LENGTH = 6
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_MINUTES = 15
+MAX_RECOVERY_ATTEMPTS = 5
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """Realiza commit/rollback da transação e fecha a conexão automaticamente ao sair do bloco 'with'."""
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    conn = sqlite3.connect(DB_PATH, timeout=20.0, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 20000")
     return conn
 
 
@@ -32,14 +53,80 @@ def _hash_password(password: str, salt: bytes | None = None) -> str:
 
 
 def _verify_password(password: str, stored_hash: str) -> bool:
-    """Verifica se a senha informada corresponde ao hash salvo."""
+    """Verifica se a senha informada corresponde ao hash salvo em tempo constante."""
     try:
         salt_hex, _ = stored_hash.split("$")
         salt = bytes.fromhex(salt_hex)
         expected_hash = _hash_password(password, salt)
-        return expected_hash == stored_hash
+        return hmac.compare_digest(expected_hash, stored_hash)
     except Exception:
         return False
+
+
+def validate_password_strength(password: str) -> str:
+    """Padroniza a validação de senhas em todo o sistema (mínimo de 6 caracteres)."""
+    if not password or not isinstance(password, str):
+        raise ValueError(f"A senha é obrigatória e deve ter pelo menos {MIN_PASSWORD_LENGTH} caracteres.")
+    cleaned = password.strip()
+    if len(cleaned) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"A senha deve ter pelo menos {MIN_PASSWORD_LENGTH} caracteres.")
+    return cleaned
+
+
+def validate_product_url(url: str) -> str:
+    """
+    Valida a URL de um produto garantindo esquema http/https válido, domínio público real
+    e bloqueando endereços locais, loopback ou IPs privados (prevenção de SSRF e XSS).
+    """
+    if not url or not isinstance(url, str):
+        raise ValueError("A URL do produto é obrigatória.")
+
+    clean_url = url.strip()
+    if len(clean_url) > 2048 or any(c in clean_url for c in (" ", "\n", "\r", "\t", "<", ">", '"', "'")):
+        raise ValueError("URL inválida: formato malformado ou caracteres não permitidos.")
+
+    parsed = urlparse(clean_url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("URL inválida: o link deve começar obrigatoriamente com http:// ou https://.")
+
+    if parsed.username or parsed.password:
+        raise ValueError("URL inválida: credenciais não são permitidas na URL.")
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname or "." not in hostname:
+        raise ValueError("URL inválida: informe um domínio público válido (ex: https://loja.com.br/produto).")
+
+    blocked_hosts = {"localhost", "0.0.0.0", "127.0.0.1", "::1", "metadata.google.internal"}
+    if hostname in blocked_hosts or hostname.endswith((".local", ".internal", ".localhost", ".lan", ".arpa")):
+        raise ValueError("URL bloqueada por segurança: endereços locais ou internos não são permitidos.")
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError("URL bloqueada por segurança: endereços IP privados ou reservados não são permitidos.")
+    except ValueError as err:
+        if "URL bloqueada" in str(err):
+            raise
+
+    return clean_url
+
+
+def mask_whatsapp_phone(phone: str) -> str:
+    """Mascara um número de WhatsApp para exibição segura (ex: +5521*****8888)."""
+    clean = normalize_whatsapp_phone(phone)
+    if len(clean) <= 6:
+        return "***"
+    visible_prefix = clean[:4]
+    visible_suffix = clean[-4:]
+    masked_len = max(len(clean) - 8, 3)
+    return f"+{visible_prefix}{'*' * masked_len}{visible_suffix}"
 
 
 def _sanitize_log_text(text: str) -> str:
@@ -124,21 +211,24 @@ def init_db() -> None:
         if "is_active" not in user_cols:
             conn.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
 
-        # Garante usuário admin padrão (id=1) e promove o usuário principal se ainda não houver nenhum admin
-        default_user = conn.execute("SELECT id FROM users WHERE id = 1").fetchone()
-        if not default_user:
-            conn.execute(
-                """
-                INSERT INTO users (
-                    id, username, display_name, password_hash, whatsapp_phone,
-                    is_admin, is_active, created_at
+        # Garante que exista pelo menos um administrador na plataforma sem escalar privilégios por username fixo
+        admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE COALESCE(is_admin, 0) = 1").fetchone()[0]
+        if admin_count == 0:
+            default_user = conn.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1").fetchone()
+            if not default_user:
+                initial_admin_pwd = os.getenv("ADMIN_INITIAL_PASSWORD", "admin123")
+                conn.execute(
+                    """
+                    INSERT INTO users (
+                        id, username, display_name, password_hash, whatsapp_phone,
+                        is_admin, is_active, created_at
+                    )
+                    VALUES (1, 'admin', 'Administrador', ?, '', 1, 1, ?)
+                    """,
+                    (_hash_password(initial_admin_pwd), now),
                 )
-                VALUES (1, 'admin', 'Administrador', ?, '', 1, 1, ?)
-                """,
-                (_hash_password("admin123"), now),
-            )
-        else:
-            conn.execute("UPDATE users SET is_admin = 1 WHERE id = 1 OR lower(username) IN ('admin', 'paulo')")
+            else:
+                conn.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (default_user["id"],))
 
         # 2. Tabela de Produtos Monitorados
         table_info = conn.execute("PRAGMA table_info(products)").fetchall()
@@ -167,6 +257,7 @@ def init_db() -> None:
                 )
                 """
             )
+            prod_cols = [c["name"] for c in conn.execute("PRAGMA table_info(products)").fetchall()]
         elif "user_id" not in prod_cols:
             conn.commit()
             conn.execute("PRAGMA foreign_keys = OFF")
@@ -192,10 +283,11 @@ def init_db() -> None:
                 )
                 """
             )
+            last_notif_expr = "last_notified_price" if "last_notified_price" in prod_cols else "NULL"
             conn.execute(
-                """
+                f"""
                 INSERT INTO products_new (id, user_id, name, url, target_price, last_notified_price, created_at)
-                SELECT id, 1, name, url, target_price, last_notified_price, ?
+                SELECT id, 1, name, url, target_price, {last_notif_expr}, ?
                 FROM products
                 """,
                 (now,),
@@ -206,10 +298,11 @@ def init_db() -> None:
             conn.execute("PRAGMA foreign_keys = ON")
             prod_cols = [c["name"] for c in conn.execute("PRAGMA table_info(products)").fetchall()]
 
-        # Migrações incrementais de colunas novas em products
+        # Migrações incrementais de colunas novas em products (apenas para bancos existentes sem essas colunas)
         for col_name, col_def in [
             ("last_price", "REAL"),
             ("previous_price", "REAL"),
+            ("last_notified_price", "REAL"),
             ("created_at", "TEXT"),
             ("last_checked_at", "TEXT"),
             ("store_name", "TEXT DEFAULT ''"),
@@ -354,6 +447,7 @@ def init_db() -> None:
             "check_interval_minutes": "60",
             "max_retries": "3",
             "delay_between_requests_sec": "1.0",
+            "log_retention_days": "90",
             "last_global_run": "",
             "last_backup_at": "",
             "last_backup_file": "",
@@ -373,11 +467,15 @@ def init_db() -> None:
                 code TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 used INTEGER DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             )
             """
         )
+        rec_cols = [c["name"] for c in conn.execute("PRAGMA table_info(recovery_codes)").fetchall()]
+        if "attempts" not in rec_cols:
+            conn.execute("ALTER TABLE recovery_codes ADD COLUMN attempts INTEGER DEFAULT 0")
 
         # 10. Tabela de Sessões Persistentes com Prazo de Expiração (Evita logout ao atualizar página)
         conn.execute(
@@ -391,6 +489,37 @@ def init_db() -> None:
             )
             """
         )
+
+        # 11. Tabela de Proteção contra Força Bruta no Login (Rate Limiting)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                username TEXT PRIMARY KEY,
+                failed_count INTEGER DEFAULT 0,
+                locked_until TEXT DEFAULT '',
+                last_attempt_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # 12. Índices de Desempenho Recomendados na Auditoria
+        index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_products_user_id ON products(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_products_status ON products(monitoring_status)",
+            "CREATE INDEX IF NOT EXISTS idx_products_url ON products(url)",
+            "CREATE INDEX IF NOT EXISTS idx_price_history_prod_checked ON price_history(product_id, checked_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_notif_logs_user_sent ON notification_logs(user_id, sent_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_notif_logs_status ON notification_logs(delivery_status)",
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_prod ON monitoring_jobs(status, product_id)",
+            "CREATE INDEX IF NOT EXISTS idx_sys_logs_created_type ON system_logs(created_at DESC, event_type)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_user_expires ON user_sessions(user_id, expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_recovery_user_used ON recovery_codes(user_id, used)",
+        ]
+        for idx_sql in index_statements:
+            conn.execute(idx_sql)
+
+    cleanup_expired_auth_data()
+    cleanup_old_logs()
 
 
 # =====================================================================
@@ -492,13 +621,19 @@ def create_user(
     whatsapp_phone: str = "",
     whatsapp_apikey: str = "",
 ) -> dict:
-    """Cria um novo perfil de usuário com senha criptografada e WhatsApp configurado."""
-    clean_username = username.strip().lower()
-    if not clean_username or not password:
-        raise ValueError("Usuário e senha são obrigatórios.")
+    """Cria um novo perfil de usuário com senha validada/criptografada e WhatsApp configurado."""
+    clean_username = (username or "").strip().lower()
+    if not clean_username:
+        raise ValueError("O nome de usuário é obrigatório.")
+    if len(clean_username) < 3 or len(clean_username) > 40 or not re.fullmatch(r"[a-z0-9_.\-]+", clean_username):
+        raise ValueError("O nome de usuário deve ter entre 3 e 40 caracteres (letras, números, '.', '_' ou '-').")
 
+    valid_password = validate_password_strength(password)
     clean_name = display_name.strip() or clean_username
     clean_phone = normalize_whatsapp_phone(whatsapp_phone)
+    if clean_phone and not is_valid_whatsapp_phone(clean_phone):
+        raise ValueError("Informe um número de WhatsApp válido com DDD (10 a 15 dígitos).")
+
     now = datetime.now().isoformat(timespec="seconds")
 
     with get_connection() as conn:
@@ -518,8 +653,8 @@ def create_user(
                     "Cada perfil deve possuir um número exclusivo."
                 )
 
-        # Se o username for 'admin' ou 'paulo', recebe permissão de admin
-        is_admin_flag = 1 if clean_username in ("admin", "paulo") else 0
+        # Novos cadastros públicos nunca recebem privilégio administrativo automaticamente por nome de usuário
+        is_admin_flag = 0
 
         cursor = conn.execute(
             """
@@ -535,7 +670,7 @@ def create_user(
             (
                 clean_username,
                 clean_name,
-                _hash_password(password),
+                _hash_password(valid_password),
                 clean_phone,
                 whatsapp_apikey.strip(),
                 is_admin_flag,
@@ -554,21 +689,79 @@ def create_user(
 
 
 def authenticate_user(username: str, password: str) -> dict | None:
-    """Autentica um usuário pelo login e senha, verificando se a conta está ativa."""
-    clean_username = username.strip().lower()
+    """
+    Autentica um usuário pelo login e senha com proteção contra força bruta (rate limiting)
+    e verificação de conta ativa.
+    """
+    clean_username = (username or "").strip().lower()
+    if not clean_username or not password:
+        return None
+
+    now = datetime.now()
+    now_str = now.isoformat(timespec="seconds")
+
     with get_connection() as conn:
+        # 1. Verifica se o usuário está temporariamente bloqueado por excesso de tentativas
+        attempt_row = conn.execute(
+            "SELECT failed_count, locked_until, last_attempt_at FROM login_attempts WHERE username = ?",
+            (clean_username,),
+        ).fetchone()
+
+        if attempt_row and attempt_row["locked_until"] and attempt_row["locked_until"] > now_str:
+            raise PermissionError(
+                f"Muitas tentativas de login incorretas. Por segurança, o acesso para '{clean_username}' "
+                f"está bloqueado temporariamente até {attempt_row['locked_until'][11:16]}."
+            )
+
         row = conn.execute(
             "SELECT * FROM users WHERE lower(username) = ?", (clean_username,)
         ).fetchone()
-        if not row:
-            return None
-        if _verify_password(password, row["password_hash"]):
+
+        if row and _verify_password(password, row["password_hash"]):
+            # Login correto -> limpa histórico de falhas
+            conn.execute("DELETE FROM login_attempts WHERE username = ?", (clean_username,))
             if row["is_active"] == 0:
+                conn.commit()
                 raise PermissionError("Sua conta está temporariamente desativada pelo administrador.")
             user_dict = dict(row)
             user_dict.pop("password_hash", None)
             return user_dict
-        return None
+
+        # 2. Login falhou -> contabiliza tentativa falha na janela de 15 minutos
+        window_start = (now - timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat(timespec="seconds")
+        if attempt_row and attempt_row["last_attempt_at"] >= window_start:
+            new_count = int(attempt_row["failed_count"] or 0) + 1
+        else:
+            new_count = 1
+
+        locked_until = ""
+        if new_count >= MAX_LOGIN_ATTEMPTS:
+            locked_until = (now + timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat(timespec="seconds")
+
+        conn.execute(
+            """
+            INSERT INTO login_attempts (username, failed_count, locked_until, last_attempt_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                failed_count = excluded.failed_count,
+                locked_until = excluded.locked_until,
+                last_attempt_at = excluded.last_attempt_at
+            """,
+            (clean_username, new_count, locked_until, now_str),
+        )
+
+    if locked_until:
+        record_system_log(
+            event_type="auth",
+            status="aviso",
+            message=f"Bloqueio temporário ativado para '{clean_username}' após {new_count} tentativas falhas de login.",
+        )
+        raise PermissionError(
+            f"Muitas tentativas de login incorretas ({MAX_LOGIN_ATTEMPTS} falhas). "
+            f"Conta bloqueada temporariamente por {LOGIN_LOCKOUT_MINUTES} minutos."
+        )
+
+    return None
 
 
 def get_user_by_id(user_id: int) -> dict | None:
@@ -592,6 +785,9 @@ def update_user_profile(
 ) -> dict | None:
     """Atualiza número de WhatsApp e preferências de notificação do perfil."""
     clean_phone = normalize_whatsapp_phone(whatsapp_phone)
+    if clean_phone and not is_valid_whatsapp_phone(clean_phone):
+        raise ValueError("Informe um número de WhatsApp válido com DDD (10 a 15 dígitos).")
+
     with get_connection() as conn:
         if clean_phone:
             phone_owner = conn.execute(
@@ -626,18 +822,21 @@ def update_user_profile(
     return get_user_by_id(user_id)
 
 
-def create_recovery_token(identifier: str) -> dict:
+def create_recovery_token(identifier: str, confirm_phone: str = "") -> dict:
     """
-    Localiza o usuário por username ou número de WhatsApp, gera um código de 6 dígitos
-    com validade de 15 minutos e retorna dados para envio no WhatsApp.
+    Localiza o usuário por username ou número de WhatsApp, gera um código criptograficamente seguro
+    de 6 dígitos com validade de 15 minutos e retorna metadados com telefone mascarado (sem expor na URL).
     """
-    clean_id = identifier.strip().lower()
+    clean_id = (identifier or "").strip().lower()
     clean_phone = normalize_whatsapp_phone(identifier)
+
+    if not clean_id:
+        raise ValueError("Informe seu nome de usuário ou número de WhatsApp cadastrado.")
 
     with get_connection() as conn:
         user_row = conn.execute(
             """
-            SELECT id, username, display_name, whatsapp_phone, is_active
+            SELECT id, username, display_name, whatsapp_phone, whatsapp_apikey, is_active
             FROM users
             WHERE lower(username) = ? OR (whatsapp_phone != '' AND whatsapp_phone = ?)
             """,
@@ -645,22 +844,27 @@ def create_recovery_token(identifier: str) -> dict:
         ).fetchone()
 
         if not user_row:
-            raise ValueError("Nenhuma conta foi encontrada com este nome de usuário ou WhatsApp.")
+            raise ValueError("Nenhuma conta foi encontrada com os dados informados.")
 
         user = dict(user_row)
         if user.get("is_active", 1) == 0:
             raise PermissionError("Esta conta está desativada. Entre em contato com o administrador.")
 
-        if not user.get("whatsapp_phone"):
+        registered_phone = user.get("whatsapp_phone") or ""
+        if not registered_phone:
             raise ValueError(
                 "Esta conta não possui número de WhatsApp cadastrado. "
                 "Solicite ao administrador a redefinição de sua senha."
             )
 
-        # Gera código numérico de 6 dígitos
-        import random
-        from datetime import timedelta
-        code = f"{random.randint(100000, 999999)}"
+        # Se o usuário buscou apenas pelo username e confirm_phone foi fornecido, valida correspondência
+        if confirm_phone.strip():
+            norm_confirm = normalize_whatsapp_phone(confirm_phone)
+            if norm_confirm != registered_phone and not registered_phone.endswith(re.sub(r"\D", "", confirm_phone)[-4:]):
+                raise ValueError("O número de WhatsApp informado não corresponde ao cadastrado nesta conta.")
+
+        # Gera código numérico criptograficamente seguro de 6 dígitos (CSPRNG)
+        code = f"{secrets.randbelow(900000) + 100000}"
         now = datetime.now()
         expires = (now + timedelta(minutes=15)).isoformat(timespec="seconds")
         now_str = now.isoformat(timespec="seconds")
@@ -673,8 +877,8 @@ def create_recovery_token(identifier: str) -> dict:
 
         conn.execute(
             """
-            INSERT INTO recovery_codes (user_id, code, expires_at, used, created_at)
-            VALUES (?, ?, ?, 0, ?)
+            INSERT INTO recovery_codes (user_id, code, expires_at, used, attempts, created_at)
+            VALUES (?, ?, ?, 0, 0, ?)
             """,
             (user["id"], code, expires, now_str),
         )
@@ -690,44 +894,74 @@ def create_recovery_token(identifier: str) -> dict:
         "user_id": user["id"],
         "username": user["username"],
         "display_name": user["display_name"],
-        "whatsapp_phone": user["whatsapp_phone"],
+        "whatsapp_phone": registered_phone,
+        "masked_phone": mask_whatsapp_phone(registered_phone),
+        "whatsapp_apikey": user.get("whatsapp_apikey", ""),
         "code": code,
         "expires_at": expires,
     }
 
 
 def reset_password_with_token(user_id: int, code: str, new_password: str) -> bool:
-    """Valida o código de 6 dígitos dentro da validade e redefine a senha do usuário."""
-    clean_code = code.strip()
-    if not clean_code or not new_password or len(new_password.strip()) < 4:
-        raise ValueError("A nova senha deve ter pelo menos 4 caracteres e o código deve ser informado.")
+    """
+    Valida o código de 6 dígitos dentro da validade com limite de tentativas contra força bruta
+    e redefine a senha do usuário usando a validação padronizada.
+    """
+    clean_code = (code or "").strip()
+    if not clean_code:
+        raise ValueError("O código de recuperação de 6 dígitos deve ser informado.")
 
+    valid_password = validate_password_strength(new_password)
     now_str = datetime.now().isoformat(timespec="seconds")
 
     with get_connection() as conn:
-        rec = conn.execute(
+        active_rec = conn.execute(
             """
-            SELECT id, expires_at, used
+            SELECT id, code, expires_at, used, COALESCE(attempts, 0) as attempts
             FROM recovery_codes
-            WHERE user_id = ? AND code = ? AND used = 0
+            WHERE user_id = ? AND used = 0
             ORDER BY id DESC LIMIT 1
             """,
-            (user_id, clean_code),
+            (user_id,),
         ).fetchone()
 
-        if not rec:
+        if not active_rec:
             raise ValueError("Código de recuperação inválido ou já utilizado.")
 
-        if rec["expires_at"] < now_str:
+        if active_rec["expires_at"] < now_str:
+            conn.execute("UPDATE recovery_codes SET used = 1 WHERE id = ?", (active_rec["id"],))
+            conn.commit()
             raise ValueError("Este código de recuperação expirou (validade de 15 minutos). Solicite um novo código.")
 
-        # Marca código como utilizado
-        conn.execute("UPDATE recovery_codes SET used = 1 WHERE id = ?", (rec["id"],))
+        if not hmac.compare_digest(str(active_rec["code"]), clean_code):
+            new_attempts = int(active_rec["attempts"]) + 1
+            if new_attempts >= MAX_RECOVERY_ATTEMPTS:
+                conn.execute(
+                    "UPDATE recovery_codes SET attempts = ?, used = 1 WHERE id = ?",
+                    (new_attempts, active_rec["id"]),
+                )
+                conn.commit()
+                raise ValueError(
+                    "Código invalidado por excesso de tentativas incorretas. Solicite um novo código."
+                )
+            conn.execute(
+                "UPDATE recovery_codes SET attempts = ? WHERE id = ?",
+                (new_attempts, active_rec["id"]),
+            )
+            conn.commit()
+            remaining = MAX_RECOVERY_ATTEMPTS - new_attempts
+            raise ValueError(f"Código de recuperação incorreto. Tentativas restantes: {remaining}.")
+
+        # Marca código como utilizado e limpa bloqueios de login da conta
+        conn.execute("UPDATE recovery_codes SET used = 1 WHERE id = ?", (active_rec["id"],))
+        user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user_row:
+            conn.execute("DELETE FROM login_attempts WHERE username = ?", (user_row["username"].lower(),))
 
         # Atualiza a senha com hash PBKDF2
         conn.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
-            (_hash_password(new_password.strip()), user_id),
+            (_hash_password(valid_password), user_id),
         )
 
     record_system_log(
@@ -743,20 +977,90 @@ def reset_password_with_token(user_id: int, code: str, new_password: str) -> boo
 # SESSÕES PERSISTENTES COM LOGOUT APÓS 15 MINUTOS DE INATIVIDADE
 # =====================================================================
 
+def cleanup_expired_auth_data() -> dict:
+    """
+    Remove sessões expiradas, códigos de recuperação vencidos/antigos e bloqueios de login já expirados.
+    """
+    now = datetime.now()
+    now_str = now.isoformat(timespec="seconds")
+    used_code_cutoff = (now - timedelta(hours=24)).isoformat(timespec="seconds")
+    login_window_cutoff = (now - timedelta(minutes=LOGIN_LOCKOUT_MINUTES)).isoformat(timespec="seconds")
+
+    with get_connection() as conn:
+        cur_sessions = conn.execute(
+            "DELETE FROM user_sessions WHERE expires_at != '' AND expires_at < ?",
+            (now_str,),
+        )
+        cur_codes = conn.execute(
+            "DELETE FROM recovery_codes WHERE expires_at < ? OR (used = 1 AND created_at < ?)",
+            (now_str, used_code_cutoff),
+        )
+        cur_attempts = conn.execute(
+            """
+            DELETE FROM login_attempts
+            WHERE (locked_until != '' AND locked_until < ?)
+               OR (locked_until = '' AND last_attempt_at < ?)
+            """,
+            (now_str, login_window_cutoff),
+        )
+        return {
+            "expired_sessions_removed": cur_sessions.rowcount,
+            "expired_codes_removed": cur_codes.rowcount,
+            "expired_login_attempts_removed": cur_attempts.rowcount,
+        }
+
+
+def cleanup_old_logs(retention_days: int | None = None) -> dict:
+    """
+    Aplica política de retenção de logs removendo registros antigos de system_logs,
+    monitoring_jobs finalizados e notification_logs além do período configurado (padrão: 90 dias).
+    """
+    with get_connection() as conn:
+        if retention_days is None:
+            row = conn.execute(
+                "SELECT value FROM system_settings WHERE key = 'log_retention_days'"
+            ).fetchone()
+            try:
+                retention_days = int(row["value"]) if row else 90
+            except (ValueError, TypeError):
+                retention_days = 90
+
+        days = max(int(retention_days), 7)
+        cutoff_str = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+
+        cur_sys = conn.execute(
+            "DELETE FROM system_logs WHERE created_at < ?",
+            (cutoff_str,),
+        )
+        cur_jobs = conn.execute(
+            "DELETE FROM monitoring_jobs WHERE status IN ('concluido', 'falha', 'erro') AND created_at < ?",
+            (cutoff_str,),
+        )
+        cur_notif = conn.execute(
+            "DELETE FROM notification_logs WHERE sent_at < ?",
+            (cutoff_str,),
+        )
+        return {
+            "retention_days": days,
+            "system_logs_removed": cur_sys.rowcount,
+            "monitoring_jobs_removed": cur_jobs.rowcount,
+            "notification_logs_removed": cur_notif.rowcount,
+        }
+
+
 def create_user_session(user_id: int, duration_minutes: int = 15) -> str:
     """
     Gera um token seguro de sessão (UUID4) com prazo de 15 minutos de inatividade.
     Ao recarregar a página dentro dos 15 minutos, o login é mantido.
     Após 15 minutos sem atividade, o logout é realizado automaticamente.
     """
+    cleanup_expired_auth_data()
     token = uuid.uuid4().hex
     now = datetime.now()
     now_str = now.isoformat(timespec="seconds")
     expires = (now + timedelta(minutes=duration_minutes)).isoformat(timespec="seconds")
 
     with get_connection() as conn:
-        # Limpa sessões expiradas antigas
-        conn.execute("DELETE FROM user_sessions WHERE expires_at != '' AND expires_at < ?", (now_str,))
         conn.execute(
             """
             INSERT INTO user_sessions (session_token, user_id, expires_at, created_at)
@@ -771,7 +1075,8 @@ def get_user_from_session_token(token: str, renew_minutes: int = 15) -> dict | N
     """
     Valida um token de sessão salvo:
     - Se ultrapassar 15 minutos de inatividade (expirado), exclui a sessão e retorna None (logout).
-    - Se for válido e o usuário estiver ativo, renova o prazo por mais 15 minutos a partir da última ação.
+    - Se for válido e o usuário estiver ativo, renova o prazo por mais 15 minutos a partir da última ação,
+      com throttling de escrita (evita UPDATE redundante em reruns na mesma janela de 15 segundos).
     """
     if not token or not isinstance(token, str):
         return None
@@ -783,6 +1088,7 @@ def get_user_from_session_token(token: str, renew_minutes: int = 15) -> dict | N
     now = datetime.now()
     now_str = now.isoformat(timespec="seconds")
     new_expires = (now + timedelta(minutes=renew_minutes)).isoformat(timespec="seconds")
+    throttle_threshold = (now + timedelta(minutes=renew_minutes, seconds=-15)).isoformat(timespec="seconds")
 
     with get_connection() as conn:
         row = conn.execute(
@@ -798,9 +1104,12 @@ def get_user_from_session_token(token: str, renew_minutes: int = 15) -> dict | N
         if not row:
             return None
 
-        # Se passou de 15 minutos de inatividade, sessão expirada -> logout
+        # Se passou de 15 minutos de inatividade, sessão expirada -> limpa expiradas e faz logout
         if row["expires_at"] and row["expires_at"] < now_str:
-            conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
+            conn.execute(
+                "DELETE FROM user_sessions WHERE session_token = ? OR (expires_at != '' AND expires_at < ?)",
+                (clean_token, now_str),
+            )
             return None
 
         # Se usuário foi desativado pelo administrador
@@ -808,11 +1117,12 @@ def get_user_from_session_token(token: str, renew_minutes: int = 15) -> dict | N
             conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
             return None
 
-        # Renova o prazo da sessão por mais 15 minutos (sessão deslizante)
-        conn.execute(
-            "UPDATE user_sessions SET expires_at = ? WHERE session_token = ?",
-            (new_expires, clean_token),
-        )
+        # Renova o prazo da sessão por mais 15 minutos (sessão deslizante com throttling de 15s)
+        if not row["expires_at"] or row["expires_at"] <= throttle_threshold:
+            conn.execute(
+                "UPDATE user_sessions SET expires_at = ? WHERE session_token = ?",
+                (new_expires, clean_token),
+            )
 
         user_dict = dict(row)
         user_dict.pop("password_hash", None)
@@ -836,10 +1146,17 @@ def delete_user_session(token: str) -> bool:
 
 def add_product(name: str, url: str, target_price: float, user_id: int = 1) -> int:
     """
-    Cadastra ou atualiza um produto associado exclusivamente ao perfil (user_id).
+    Valida a URL e os dados do produto e cadastra/atualiza exclusivamente no perfil (user_id).
     """
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("O nome do produto é obrigatório.")
+    clean_url = validate_product_url(url)
+    if float(target_price) <= 0:
+        raise ValueError("O preço-alvo deve ser maior que zero.")
+
     now = datetime.now().isoformat(timespec="seconds")
-    store = extract_store_name(url)
+    store = extract_store_name(clean_url)
     with get_connection() as conn:
         cursor = conn.execute(
             """
@@ -852,7 +1169,7 @@ def add_product(name: str, url: str, target_price: float, user_id: int = 1) -> i
                 monitoring_status = 'ativo'
             RETURNING id
             """,
-            (user_id, name.strip(), url.strip(), store, float(target_price), now),
+            (user_id, clean_name, clean_url, store, float(target_price), now),
         )
         row = cursor.fetchone()
         return row["id"]
@@ -1210,7 +1527,7 @@ def admin_list_users(admin_user_id: int) -> list[dict]:
 
 
 def admin_set_user_active(admin_user_id: int, target_user_id: int, is_active: bool) -> bool:
-    """Ativa ou desativa a conta de um usuário (impedindo desativar a si próprio)."""
+    """Ativa ou desativa a conta de um usuário (impedindo desativar a si próprio) e revoga sessões."""
     require_admin(admin_user_id)
     if admin_user_id == target_user_id and not is_active:
         raise ValueError("Você não pode desativar a sua própria conta de administrador.")
@@ -1221,6 +1538,8 @@ def admin_set_user_active(admin_user_id: int, target_user_id: int, is_active: bo
             (1 if is_active else 0, target_user_id),
         )
         changed = cursor.rowcount > 0
+        if changed and not is_active:
+            conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (target_user_id,))
 
     if changed:
         action_name = "ATIVAR_USUARIO" if is_active else "DESATIVAR_USUARIO"
@@ -1258,18 +1577,22 @@ def admin_set_user_admin(admin_user_id: int, target_user_id: int, make_admin: bo
 
 
 def admin_reset_user_password(admin_user_id: int, target_user_id: int, new_password: str) -> bool:
-    """Redefine de forma segura a senha de um usuário com hash PBKDF2."""
+    """Redefine de forma segura a senha de um usuário com hash PBKDF2 e validação padronizada."""
     require_admin(admin_user_id)
-    if not new_password or len(new_password.strip()) < 4:
-        raise ValueError("A nova senha deve ter pelo menos 4 caracteres.")
+    valid_password = validate_password_strength(new_password)
 
-    hashed = _hash_password(new_password.strip())
+    hashed = _hash_password(valid_password)
     with get_connection() as conn:
         cursor = conn.execute(
             "UPDATE users SET password_hash = ? WHERE id = ?",
             (hashed, target_user_id),
         )
         changed = cursor.rowcount > 0
+        if changed:
+            u_row = conn.execute("SELECT username FROM users WHERE id = ?", (target_user_id,)).fetchone()
+            if u_row:
+                conn.execute("DELETE FROM login_attempts WHERE username = ?", (u_row["username"].lower(),))
+            conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (target_user_id,))
 
     if changed:
         record_audit_log(
@@ -1439,12 +1762,80 @@ def admin_update_system_settings(admin_user_id: int, updates: dict) -> dict:
     return get_system_settings()
 
 
+def recover_stuck_jobs(timeout_minutes: int = 10) -> int:
+    """
+    Recupera tarefas órfãs que ficaram presas no status 'processando' há mais de timeout_minutes
+    (ex: por reinício do processo ou queda de conexão), recolocando-as em 'aguardando'.
+    """
+    cutoff = (datetime.now() - timedelta(minutes=max(timeout_minutes, 1))).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE monitoring_jobs
+            SET status = 'aguardando'
+            WHERE status = 'processando'
+              AND (started_at IS NULL OR started_at = '' OR started_at < ?)
+            """,
+            (cutoff,),
+        )
+        return cursor.rowcount
+
+
+def claim_next_monitoring_job() -> dict | None:
+    """
+    Reivindica atomicamente o próximo job com status 'aguardando' na fila usando transação imediata,
+    evitando race conditions entre workers.
+    """
+    now_start = datetime.now().isoformat(timespec="seconds")
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        job_row = conn.execute(
+            """
+            SELECT j.*, p.name, p.url, p.target_price, p.last_price, p.last_notified_price
+            FROM monitoring_jobs j
+            JOIN products p ON p.id = j.product_id
+            WHERE j.status = 'aguardando'
+            ORDER BY j.id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not job_row:
+            conn.execute("COMMIT")
+            return None
+
+        job = dict(job_row)
+        cursor = conn.execute(
+            """
+            UPDATE monitoring_jobs
+            SET status = 'processando', started_at = ?
+            WHERE id = ? AND status = 'aguardando'
+            """,
+            (now_start, job["id"]),
+        )
+        conn.execute("COMMIT")
+        if cursor.rowcount == 0:
+            return None
+        job["started_at"] = now_start
+        return job
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def admin_enqueue_global_verification(admin_user_id: int) -> int:
     """
     Adiciona todos os produtos ativos à fila de processamento (Job Queue),
-    evitando enfileirar tarefas duplicadas para o mesmo product_id que já esteja aguardando/processando.
+    recuperando antes tarefas órfãs e evitando enfileirar duplicadas para o mesmo product_id.
     """
     require_admin(admin_user_id)
+    recover_stuck_jobs(timeout_minutes=10)
     now = datetime.now().isoformat(timespec="seconds")
     settings = get_system_settings()
     max_retries = int(settings.get("max_retries", "3") or 3)

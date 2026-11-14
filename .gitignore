@@ -2,20 +2,32 @@
 .venv/
 venv/
 ENV/
+env/
 
-# Bytecodes e caches do Python
+# Bytecodes, caches e testes do Python
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.coverage
+htmlcov/
 
-# Banco de dados local e dados temporários
+# Banco de dados SQLite local, WAL/SHM e backups
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 prices.db
 backups/
 
-# Chaves e segredos (NUNCA subir para o GitHub!)
+# Chaves, variáveis de ambiente e segredos (NUNCA subir para o GitHub!)
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
-# Arquivos do sistema
+# Arquivos do sistema operacional e IDEs
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
