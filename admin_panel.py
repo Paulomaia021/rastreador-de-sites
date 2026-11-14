@@ -7,11 +7,15 @@ import database
 import notifier
 import main
 
-if not hasattr(database, "admin_get_dashboard_kpis"):
+if (
+    not hasattr(database, "admin_get_dashboard_kpis")
+    or not hasattr(database, "MIN_PASSWORD_LENGTH")
+    or not hasattr(database, "cleanup_old_logs")
+):
     importlib.reload(database)
-if not hasattr(notifier, "admin_retry_notification"):
+if not hasattr(notifier, "admin_retry_notification") or not hasattr(notifier, "send_recovery_code_whatsapp"):
     importlib.reload(notifier)
-if not hasattr(main, "trigger_background_queue_worker"):
+if not hasattr(main, "trigger_background_queue_worker") or not hasattr(main, "_is_retryable_scraper_error"):
     importlib.reload(main)
 
 from database import (

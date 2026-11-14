@@ -7,18 +7,23 @@ import scraper
 import notifier
 import main
 
-# Garante que o Streamlit Cloud atualize os módulos base em memória ANTES de importar admin_panel
-if not hasattr(database, "admin_get_dashboard_kpis") or not hasattr(database, "create_user_session"):
+# Garante que o Streamlit Cloud atualize os módulos base em memória ANTES de importar símbolos novos
+if (
+    not hasattr(database, "admin_get_dashboard_kpis")
+    or not hasattr(database, "create_user_session")
+    or not hasattr(database, "MIN_PASSWORD_LENGTH")
+    or not hasattr(database, "cleanup_old_logs")
+):
     importlib.reload(database)
-if not hasattr(scraper, "ScraperError"):
+if not hasattr(scraper, "ScraperError") or not hasattr(scraper, "_get_http_session"):
     importlib.reload(scraper)
-if not hasattr(notifier, "admin_retry_notification"):
+if not hasattr(notifier, "admin_retry_notification") or not hasattr(notifier, "send_recovery_code_whatsapp"):
     importlib.reload(notifier)
-if not hasattr(main, "trigger_background_queue_worker"):
+if not hasattr(main, "trigger_background_queue_worker") or not hasattr(main, "_is_retryable_scraper_error"):
     importlib.reload(main)
 
 import admin_panel
-if not hasattr(admin_panel, "render_admin_panel"):
+if not hasattr(admin_panel, "render_admin_panel") or not hasattr(admin_panel, "_paginate_list"):
     importlib.reload(admin_panel)
 
 from database import (
