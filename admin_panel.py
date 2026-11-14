@@ -1,7 +1,19 @@
 from __future__ import annotations
+import importlib
 from pathlib import Path
 import streamlit as st
 import pandas as pd
+import database
+import notifier
+import main
+
+if not hasattr(database, "admin_get_dashboard_kpis"):
+    importlib.reload(database)
+if not hasattr(notifier, "admin_retry_notification"):
+    importlib.reload(notifier)
+if not hasattr(main, "trigger_background_queue_worker"):
+    importlib.reload(main)
+
 from database import (
     require_admin,
     admin_get_dashboard_kpis,

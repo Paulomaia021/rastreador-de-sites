@@ -6,15 +6,19 @@ import database
 import scraper
 import notifier
 import main
-import admin_panel
 
-# Garante que o Streamlit Cloud atualize os módulos em memória após um git push sem precisar reiniciar o servidor
+# Garante que o Streamlit Cloud atualize os módulos base em memória ANTES de importar admin_panel
 if not hasattr(database, "admin_get_dashboard_kpis"):
     importlib.reload(database)
+if not hasattr(scraper, "ScraperError"):
     importlib.reload(scraper)
+if not hasattr(notifier, "admin_retry_notification"):
     importlib.reload(notifier)
+if not hasattr(main, "trigger_background_queue_worker"):
     importlib.reload(main)
-    importlib.reload(admin_panel)
+
+import admin_panel
+importlib.reload(admin_panel)
 
 from database import (
     init_db,
