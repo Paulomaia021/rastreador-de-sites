@@ -7,7 +7,8 @@ import os
 import re
 import shutil
 import sqlite3
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -378,6 +379,19 @@ def init_db() -> None:
             """
         )
 
+        # 10. Tabela de Sessões Persistentes com Prazo de Expiração (Evita logout ao atualizar página)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            """
+        )
+
 
 # =====================================================================
 # CONTROLE DE ACESSO E VALIDAÇÃO DE PERMISSÕES NO BACKEND (ETAPA 2)
@@ -722,6 +736,87 @@ def reset_password_with_token(user_id: int, code: str, new_password: str) -> boo
         message=f"Senha redefinida com sucesso via código de recuperação para usuário ID {user_id}",
         user_id=user_id,
     )
+    return True
+
+
+# =====================================================================
+# SESSÕES PERSISTENTES COM PRAZO DE EXPIRAÇÃO (LOGIN PERMANENTE)
+# =====================================================================
+
+def create_user_session(user_id: int, duration_days: int = 14) -> str:
+    """
+    Gera um token seguro de sessão (UUID4) com prazo de validade configurável (padrão: 14 dias),
+    armazena no banco e retorna o token para persistência de login no navegador.
+    """
+    token = uuid.uuid4().hex
+    now = datetime.now()
+    expires = (now + timedelta(days=duration_days)).isoformat(timespec="seconds")
+    now_str = now.isoformat(timespec="seconds")
+
+    with get_connection() as conn:
+        # Limpa sessões expiradas antes de criar a nova
+        conn.execute("DELETE FROM user_sessions WHERE expires_at < ?", (now_str,))
+        conn.execute(
+            """
+            INSERT INTO user_sessions (session_token, user_id, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (token, user_id, expires, now_str),
+        )
+    return token
+
+
+def get_user_from_session_token(token: str) -> dict | None:
+    """
+    Valida um token de sessão salvo. Se o token for válido, não tiver expirado
+    e a conta de usuário estiver ativa, retorna os dados do usuário.
+    Caso contrário, limpa o token expirado e retorna None.
+    """
+    if not token or not isinstance(token, str):
+        return None
+
+    clean_token = token.strip()
+    if not clean_token:
+        return None
+
+    now_str = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT s.session_token, s.expires_at, u.*
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.session_token = ?
+            """,
+            (clean_token,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        # Verifica se expirou
+        if row["expires_at"] < now_str:
+            conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
+            return None
+
+        # Verifica se a conta do usuário foi desativada
+        if row["is_active"] == 0:
+            conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (clean_token,))
+            return None
+
+        user_dict = dict(row)
+        user_dict.pop("password_hash", None)
+        user_dict.pop("session_token", None)
+        user_dict.pop("expires_at", None)
+        return user_dict
+
+
+def delete_user_session(token: str) -> bool:
+    """Exclui o token de sessão do banco de dados quando o usuário clica em Sair da Conta."""
+    if not token:
+        return False
+    with get_connection() as conn:
+        conn.execute("DELETE FROM user_sessions WHERE session_token = ?", (token.strip(),))
     return True
 
 

@@ -8,7 +8,7 @@ import notifier
 import main
 
 # Garante que o Streamlit Cloud atualize os módulos base em memória ANTES de importar admin_panel
-if not hasattr(database, "admin_get_dashboard_kpis"):
+if not hasattr(database, "admin_get_dashboard_kpis") or not hasattr(database, "create_user_session"):
     importlib.reload(database)
 if not hasattr(scraper, "ScraperError"):
     importlib.reload(scraper)
@@ -33,6 +33,9 @@ from database import (
     delete_product,
     get_user_price_history,
     get_user_notifications,
+    create_user_session,
+    get_user_from_session_token,
+    delete_user_session,
 )
 from main import check_all_products
 from notifier import (
@@ -58,6 +61,17 @@ if "confirm_delete_id" not in st.session_state:
     st.session_state["confirm_delete_id"] = None
 if "last_alerts" not in st.session_state:
     st.session_state["last_alerts"] = []
+
+# Persistência de login: recupera a sessão do usuário caso tenha atualizado a página (F5)
+if st.session_state["user"] is None:
+    session_token = st.query_params.get("session_token")
+    if session_token:
+        persisted_user = get_user_from_session_token(session_token)
+        if persisted_user:
+            st.session_state["user"] = persisted_user
+        else:
+            # Token expirado ou inválido: limpa o parâmetro da URL
+            st.query_params.pop("session_token", None)
 
 
 def render_auth_screen() -> None:
@@ -85,6 +99,8 @@ def render_auth_screen() -> None:
                     try:
                         user = authenticate_user(username, password)
                         if user:
+                            token = create_user_session(user["id"], duration_days=14)
+                            st.query_params["session_token"] = token
                             st.session_state["user"] = user
                             st.session_state["last_alerts"] = []
                             st.rerun()
@@ -117,6 +133,8 @@ def render_auth_screen() -> None:
                                 display_name=new_display_name,
                                 whatsapp_phone=new_whatsapp,
                             )
+                            token = create_user_session(created["id"], duration_days=14)
+                            st.query_params["session_token"] = token
                             st.session_state["user"] = created
                             st.success("Perfil criado com sucesso!")
                             st.rerun()
@@ -214,6 +232,10 @@ if not st.session_state["user"]:
 # Usuário autenticado: recarrega dados frescos do banco garantindo isolamento e checando se está ativo
 current_user = get_user_by_id(st.session_state["user"]["id"])
 if not current_user or current_user.get("is_active", 1) == 0:
+    token_to_clear = st.query_params.get("session_token")
+    if token_to_clear:
+        delete_user_session(token_to_clear)
+    st.query_params.pop("session_token", None)
     st.session_state["user"] = None
     st.rerun()
 st.session_state["user"] = current_user
@@ -233,8 +255,13 @@ with st.sidebar:
         else "⚠️ Não configurado"
     )
     st.caption(f"📱 WhatsApp ativo: **{phone_display}**")
+    st.caption("🔒 *Login salvo (14 dias de validade)*")
 
     if st.button("🚪 Sair da Conta", use_container_width=True):
+        current_token = st.query_params.get("session_token")
+        if current_token:
+            delete_user_session(current_token)
+        st.query_params.pop("session_token", None)
         st.session_state["user"] = None
         st.session_state["confirm_delete_id"] = None
         st.session_state["last_alerts"] = []
