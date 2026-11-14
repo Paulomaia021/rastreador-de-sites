@@ -363,6 +363,21 @@ def init_db() -> None:
                 (k, v, now),
             )
 
+        # 9. Tabela de Códigos de Recuperação de Conta via WhatsApp
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recovery_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            """
+        )
+
 
 # =====================================================================
 # CONTROLE DE ACESSO E VALIDAÇÃO DE PERMISSÕES NO BACKEND (ETAPA 2)
@@ -595,6 +610,119 @@ def update_user_profile(
             ),
         )
     return get_user_by_id(user_id)
+
+
+def create_recovery_token(identifier: str) -> dict:
+    """
+    Localiza o usuário por username ou número de WhatsApp, gera um código de 6 dígitos
+    com validade de 15 minutos e retorna dados para envio no WhatsApp.
+    """
+    clean_id = identifier.strip().lower()
+    clean_phone = normalize_whatsapp_phone(identifier)
+
+    with get_connection() as conn:
+        user_row = conn.execute(
+            """
+            SELECT id, username, display_name, whatsapp_phone, is_active
+            FROM users
+            WHERE lower(username) = ? OR (whatsapp_phone != '' AND whatsapp_phone = ?)
+            """,
+            (clean_id, clean_phone),
+        ).fetchone()
+
+        if not user_row:
+            raise ValueError("Nenhuma conta foi encontrada com este nome de usuário ou WhatsApp.")
+
+        user = dict(user_row)
+        if user.get("is_active", 1) == 0:
+            raise PermissionError("Esta conta está desativada. Entre em contato com o administrador.")
+
+        if not user.get("whatsapp_phone"):
+            raise ValueError(
+                "Esta conta não possui número de WhatsApp cadastrado. "
+                "Solicite ao administrador a redefinição de sua senha."
+            )
+
+        # Gera código numérico de 6 dígitos
+        import random
+        from datetime import timedelta
+        code = f"{random.randint(100000, 999999)}"
+        now = datetime.now()
+        expires = (now + timedelta(minutes=15)).isoformat(timespec="seconds")
+        now_str = now.isoformat(timespec="seconds")
+
+        # Invalida códigos anteriores não usados deste usuário
+        conn.execute(
+            "UPDATE recovery_codes SET used = 1 WHERE user_id = ? AND used = 0",
+            (user["id"],),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO recovery_codes (user_id, code, expires_at, used, created_at)
+            VALUES (?, ?, ?, 0, ?)
+            """,
+            (user["id"], code, expires, now_str),
+        )
+
+    record_system_log(
+        event_type="auth",
+        status="sucesso",
+        message=f"Código de recuperação gerado para @{user['username']}",
+        user_id=user["id"],
+    )
+
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "display_name": user["display_name"],
+        "whatsapp_phone": user["whatsapp_phone"],
+        "code": code,
+        "expires_at": expires,
+    }
+
+
+def reset_password_with_token(user_id: int, code: str, new_password: str) -> bool:
+    """Valida o código de 6 dígitos dentro da validade e redefine a senha do usuário."""
+    clean_code = code.strip()
+    if not clean_code or not new_password or len(new_password.strip()) < 4:
+        raise ValueError("A nova senha deve ter pelo menos 4 caracteres e o código deve ser informado.")
+
+    now_str = datetime.now().isoformat(timespec="seconds")
+
+    with get_connection() as conn:
+        rec = conn.execute(
+            """
+            SELECT id, expires_at, used
+            FROM recovery_codes
+            WHERE user_id = ? AND code = ? AND used = 0
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, clean_code),
+        ).fetchone()
+
+        if not rec:
+            raise ValueError("Código de recuperação inválido ou já utilizado.")
+
+        if rec["expires_at"] < now_str:
+            raise ValueError("Este código de recuperação expirou (validade de 15 minutos). Solicite um novo código.")
+
+        # Marca código como utilizado
+        conn.execute("UPDATE recovery_codes SET used = 1 WHERE id = ?", (rec["id"],))
+
+        # Atualiza a senha com hash PBKDF2
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (_hash_password(new_password.strip()), user_id),
+        )
+
+    record_system_log(
+        event_type="auth",
+        status="sucesso",
+        message=f"Senha redefinida com sucesso via código de recuperação para usuário ID {user_id}",
+        user_id=user_id,
+    )
+    return True
 
 
 # =====================================================================

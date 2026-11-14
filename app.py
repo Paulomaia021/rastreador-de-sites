@@ -70,7 +70,9 @@ def render_auth_screen() -> None:
 
     col_left, col_center, col_right = st.columns([1, 2, 1])
     with col_center:
-        tab_login, tab_register = st.tabs(["🔑 Entrar na Conta", "📝 Criar Meu Perfil"])
+        tab_login, tab_register, tab_recovery = st.tabs(
+            ["🔑 Entrar na Conta", "📝 Criar Meu Perfil", "🔄 Recuperar Conta"]
+        )
 
         with tab_login:
             with st.form("login_form"):
@@ -120,6 +122,88 @@ def render_auth_screen() -> None:
                             st.rerun()
                         except ValueError as err:
                             st.error(str(err))
+
+        with tab_recovery:
+            st.subheader("Redefinir minha senha")
+            st.caption(
+                "Informe seu nome de usuário ou número de WhatsApp cadastrado. "
+                "Enviaremos um código de verificação de 6 dígitos para o seu WhatsApp."
+            )
+
+            if "recovery_data" not in st.session_state:
+                st.session_state["recovery_data"] = None
+
+            # Passo 1: Solicitar código
+            with st.form("request_code_form"):
+                rec_identifier = st.text_input(
+                    "Seu Usuário ou WhatsApp cadastrado",
+                    placeholder="Ex: paulo ou 21999998888",
+                )
+                btn_send_code = st.form_submit_button("📲 Gerar Código de Recuperação", use_container_width=True)
+
+                if btn_send_code:
+                    if not rec_identifier.strip():
+                        st.warning("Informe seu nome de usuário ou número de WhatsApp.")
+                    else:
+                        from database import create_recovery_token
+                        try:
+                            rec_info = create_recovery_token(rec_identifier.strip())
+                            st.session_state["recovery_data"] = rec_info
+                            st.success(
+                                f"Código de 6 dígitos gerado com sucesso para a conta de "
+                                f"**{rec_info['display_name']}**!"
+                            )
+                            st.rerun()
+                        except Exception as err:
+                            st.error(str(err))
+
+            # Se código foi gerado, exibe botão de envio e formulário de redefinição
+            if st.session_state.get("recovery_data"):
+                rec_info = st.session_state["recovery_data"]
+                rec_phone = rec_info["whatsapp_phone"]
+                rec_code = rec_info["code"]
+
+                recovery_msg = (
+                    f"🔐 *Recuperação de Conta — Rastreador de Preços*\n\n"
+                    f"Olá, *{rec_info['display_name']}*!\n"
+                    f"Seu código de segurança para redefinir sua senha é:\n\n"
+                    f"👉 *{rec_code}*\n\n"
+                    f"Este código expira em 15 minutos. Se você não solicitou, ignore esta mensagem."
+                )
+                wa_rec_link = generate_whatsapp_link(rec_phone, recovery_msg)
+
+                st.markdown("---")
+                st.info(f"📱 Destino WhatsApp: **+{rec_phone}**")
+                st.link_button(
+                    "📲 Enviar Código para Meu WhatsApp",
+                    wa_rec_link,
+                    type="primary",
+                    use_container_width=True,
+                )
+
+                # Formulário para digitar código e nova senha
+                with st.form("submit_new_password_form"):
+                    st.markdown("#### Digite o código recebido e sua nova senha")
+                    code_input = st.text_input("Código de 6 dígitos", placeholder="Ex: 123456", max_chars=6)
+                    new_pwd1 = st.text_input("Nova Senha", type="password", placeholder="Mínimo 4 caracteres")
+                    new_pwd2 = st.text_input("Confirme a Nova Senha", type="password")
+                    btn_confirm_reset = st.form_submit_button("✅ Redefinir Senha e Entrar", use_container_width=True)
+
+                    if btn_confirm_reset:
+                        if new_pwd1 != new_pwd2:
+                            st.error("As senhas digitadas não coincidem. Tente novamente.")
+                        else:
+                            from database import reset_password_with_token
+                            try:
+                                reset_password_with_token(
+                                    user_id=rec_info["user_id"],
+                                    code=code_input,
+                                    new_password=new_pwd1,
+                                )
+                                st.session_state["recovery_data"] = None
+                                st.success("🎉 Senha alterada com sucesso! Você já pode entrar com sua nova senha.")
+                            except Exception as err:
+                                st.error(str(err))
 
 
 # Se não estiver logado, mostra apenas a tela de autenticação
