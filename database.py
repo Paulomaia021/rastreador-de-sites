@@ -479,6 +479,16 @@ def create_user(
         if existing:
             raise ValueError("Este nome de usuário já está em uso. Escolha outro.")
 
+        if clean_phone:
+            phone_owner = conn.execute(
+                "SELECT username FROM users WHERE whatsapp_phone = ?", (clean_phone,)
+            ).fetchone()
+            if phone_owner:
+                raise ValueError(
+                    f"Este número de WhatsApp já está cadastrado em outra conta (@{phone_owner['username']}). "
+                    "Cada perfil deve possuir um número exclusivo."
+                )
+
         # Se o username for 'admin' ou 'paulo', recebe permissão de admin
         is_admin_flag = 1 if clean_username in ("admin", "paulo") else 0
 
@@ -554,6 +564,17 @@ def update_user_profile(
     """Atualiza número de WhatsApp e preferências de notificação do perfil."""
     clean_phone = normalize_whatsapp_phone(whatsapp_phone)
     with get_connection() as conn:
+        if clean_phone:
+            phone_owner = conn.execute(
+                "SELECT id, username FROM users WHERE whatsapp_phone = ? AND id != ?",
+                (clean_phone, user_id),
+            ).fetchone()
+            if phone_owner:
+                raise ValueError(
+                    f"Este número de WhatsApp já está em uso na conta @{phone_owner['username']}. "
+                    "Cada conta deve ter um número único."
+                )
+
         conn.execute(
             """
             UPDATE users
