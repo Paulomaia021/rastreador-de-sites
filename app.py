@@ -90,11 +90,7 @@ def render_auth_screen() -> None:
                 new_whatsapp = st.text_input(
                     "Seu WhatsApp (com DDD)",
                     placeholder="Ex: 21999998888",
-                    help="Número onde você receberá os alertas de queda de preço.",
-                )
-                new_apikey = st.text_input(
-                    "Chave API WhatsApp CallMeBot (Opcional)",
-                    placeholder="Deixe em branco se quiser configurar depois",
+                    help="Digite apenas o DDD + número. Você receberá seus alertas de preço neste WhatsApp.",
                 )
                 submit_register = st.form_submit_button("Criar Conta e Entrar", use_container_width=True)
 
@@ -108,7 +104,6 @@ def render_auth_screen() -> None:
                                 password=new_password,
                                 display_name=new_display_name,
                                 whatsapp_phone=new_whatsapp,
-                                whatsapp_apikey=new_apikey,
                             )
                             st.session_state["user"] = created
                             st.success("Perfil criado com sucesso!")
@@ -391,16 +386,10 @@ with tab_whatsapp:
     with st.form("profile_whatsapp_form"):
         edit_name = st.text_input("Seu Nome de Exibição", value=current_user.get("display_name", ""))
         edit_phone = st.text_input(
-            "Número do WhatsApp (com DDI + DDD)",
+            "Número do WhatsApp (com DDD)",
             value=current_user.get("whatsapp_phone", ""),
-            placeholder="Ex: 5521999998888",
-            help="Informe apenas números (ex: 55 + DDD + seu número).",
-        )
-        edit_apikey = st.text_input(
-            "Chave API CallMeBot para Envio Automático em Background (Opcional)",
-            value=current_user.get("whatsapp_apikey", ""),
-            placeholder="Ex: 1234567",
-            help="Permite que o sistema envie mensagens sozinho para o seu WhatsApp sem precisar clicar.",
+            placeholder="Ex: 21999998888",
+            help="Informe seu DDD + número (ex: 21999998888). O código 55 do Brasil é adicionado automaticamente.",
         )
         edit_enabled = st.checkbox(
             "Ativar notificações via WhatsApp para minha conta",
@@ -410,6 +399,13 @@ with tab_whatsapp:
             "Avisar também quando houver qualquer queda de preço relevante (mesmo acima da meta)",
             value=bool(current_user.get("notify_on_any_drop", 1)),
         )
+
+        with st.expander("⚙️ Chave de API Automática (Opcional — apenas se possuir)"):
+            edit_apikey = st.text_input(
+                "Chave API WhatsApp (Opcional)",
+                value=current_user.get("whatsapp_apikey", ""),
+                placeholder="Deixe em branco para usar o envio direto do WhatsApp",
+            )
 
         save_profile = st.form_submit_button("💾 Salvar Configurações de WhatsApp", type="primary")
         if save_profile:
@@ -426,49 +422,18 @@ with tab_whatsapp:
             st.rerun()
 
     st.divider()
-    col_test, col_help = st.columns([1, 1])
-
-    with col_test:
-        st.markdown("#### 🧪 Testar Notificação no Meu WhatsApp")
-        if current_user.get("whatsapp_phone"):
-            test_msg = (
-                f"✅ *Teste do Rastreador de Preços*\n\n"
-                f"Olá, *{current_user['display_name']}*! Seu número (+{current_user['whatsapp_phone']}) "
-                f"está configurado para receber alertas dos seus produtos."
-            )
-            test_wa_link = generate_whatsapp_link(current_user["whatsapp_phone"], test_msg)
-
-            if st.button("🚀 Disparar Teste Automático via API", use_container_width=True):
-                res = send_whatsapp_message(
-                    phone=current_user["whatsapp_phone"],
-                    message=test_msg,
-                    user_apikey=current_user.get("whatsapp_apikey", ""),
-                )
-                if res["method"] != "whatsapp_direct":
-                    st.success(f"Mensagem enviada automaticamente! ({res['detail']})")
-                else:
-                    st.info(
-                        "Alerta preparado! Para envio 100% automático em segundo plano sem clicar, "
-                        "veja ao lado como ativar a chave gratuita CallMeBot, ou clique no botão abaixo:"
-                    )
-
-            st.link_button(
-                "📲 Abrir Mensagem de Teste no Meu WhatsApp",
-                test_wa_link,
-                use_container_width=True,
-            )
-        else:
-            st.info("Salve seu número de WhatsApp acima para liberar o teste de envio.")
-
-    with col_help:
-        with st.expander("💡 Como ativar o envio 100% automático e gratuito no WhatsApp (CallMeBot)?", expanded=True):
-            st.markdown(
-                """
-                Se você quiser que o servidor envie a mensagem sozinho para o seu WhatsApp assim que o preço cair:
-                1. Adicione o contato **`+34 644 52 74 88`** na agenda do seu celular.
-                2. Envie a seguinte mensagem para ele no WhatsApp:
-                   `I allow callmebot to send me messages`
-                3. Em poucos segundos, o bot responderá com a sua **API Key** gratuita (ex: `1234567`).
-                4. Cole essa chave no campo **"Chave API CallMeBot"** ao lado e clique em **Salvar**!
-                """
-            )
+    st.markdown("#### 🧪 Testar Notificação no Meu WhatsApp")
+    if current_user.get("whatsapp_phone"):
+        test_msg = (
+            f"✅ *Teste do Rastreador de Preços*\n\n"
+            f"Olá, *{current_user['display_name']}*! Seu número (+{current_user['whatsapp_phone']}) "
+            f"está configurado para receber alertas dos seus produtos."
+        )
+        test_wa_link = generate_whatsapp_link(current_user["whatsapp_phone"], test_msg)
+        st.link_button(
+            f"📲 Enviar Mensagem de Teste para Meu WhatsApp (+{current_user['whatsapp_phone']})",
+            test_wa_link,
+            type="primary",
+        )
+    else:
+        st.info("Salve seu número de WhatsApp acima para liberar o teste de envio.")

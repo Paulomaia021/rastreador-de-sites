@@ -8,6 +8,20 @@ from database import normalize_whatsapp_phone
 load_dotenv()
 
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Busca variável no .env ou no st.secrets do Streamlit Cloud."""
+    val = os.getenv(key, "")
+    if val:
+        return str(val).strip()
+    try:
+        import streamlit as st
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return default
+
+
 def format_whatsapp_message(
     product_name: str,
     current_price: float,
@@ -60,10 +74,11 @@ def send_whatsapp_message(
     """
     Envia a notificação via WhatsApp diretamente para o número do usuário.
     Suporta:
-      1. CallMeBot WhatsApp API (gratuita por usuário via whatsapp_apikey no perfil ou .env)
-      2. Gateway/Webhook WhatsApp (Evolution API, Z-API, etc. via WHATSAPP_API_URL no .env)
-      3. Twilio WhatsApp API (via TWILIO_ACCOUNT_SID no .env)
-      4. Link direto wa.me pronto para envio/abertura imediata
+      1. Twilio WhatsApp API (Gratuito via Sandbox em twilio.com)
+      2. Meta WhatsApp Cloud API Oficial (Gratuito até 1.000 conversas/mês)
+      3. Gateway/Webhook WhatsApp (Evolution API, Z-API, etc.)
+      4. CallMeBot API (caso o usuário já possua uma chave ativa)
+      5. Link direto wa.me pronto para abertura em 1 clique no iOS/Android/Web
     """
     clean_phone = normalize_whatsapp_phone(phone)
     wa_link = generate_whatsapp_link(clean_phone, message)
@@ -76,34 +91,68 @@ def send_whatsapp_message(
             "whatsapp_url": wa_link,
         }
 
-    # 1. Tentativa via CallMeBot WhatsApp API (100% gratuito para número pessoal)
-    api_key = (user_apikey or os.getenv("WHATSAPP_CALLMEBOT_APIKEY", "")).strip()
-    if api_key:
+    # 1. Tentativa via Twilio WhatsApp API (Funciona imediatamente com Twilio Sandbox gratuito)
+    twilio_sid = _get_secret("TWILIO_ACCOUNT_SID")
+    twilio_token = _get_secret("TWILIO_AUTH_TOKEN")
+    twilio_from = _get_secret("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+    if twilio_sid and twilio_token:
         try:
-            callmebot_url = "https://api.callmebot.com/whatsapp.php"
-            resp = requests.get(
-                callmebot_url,
-                params={
-                    "phone": f"+{clean_phone}",
-                    "text": message,
-                    "apikey": api_key,
+            twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+            resp = requests.post(
+                twilio_url,
+                data={
+                    "From": twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}",
+                    "To": f"whatsapp:+{clean_phone}",
+                    "Body": message,
                 },
-                timeout=15,
+                auth=(twilio_sid, twilio_token),
+                timeout=12,
             )
-            if resp.status_code == 200 and "error" not in resp.text.lower():
-                print(f"-> WhatsApp enviado automaticamente (CallMeBot) para +{clean_phone}!")
+            if resp.ok:
+                print(f"-> WhatsApp enviado via Twilio para +{clean_phone}!")
                 return {
                     "sent": True,
-                    "method": "whatsapp_api",
-                    "detail": f"Enviado via WhatsApp para +{clean_phone}",
+                    "method": "twilio_whatsapp",
+                    "detail": f"Enviado automaticamente via WhatsApp (Twilio) para +{clean_phone}",
                     "whatsapp_url": wa_link,
                 }
         except Exception as e:
-            print(f"-> Aviso ao tentar CallMeBot WhatsApp API: {e}")
+            print(f"-> Erro ao enviar via Twilio WhatsApp: {e}")
 
-    # 2. Tentativa via Webhook/API de WhatsApp (Evolution API / Z-API / Gateway próprio)
-    whatsapp_api_url = os.getenv("WHATSAPP_API_URL", "").strip()
-    whatsapp_api_token = os.getenv("WHATSAPP_API_TOKEN", "").strip()
+    # 2. Tentativa via Meta WhatsApp Cloud API Oficial
+    meta_token = _get_secret("WHATSAPP_META_TOKEN")
+    meta_phone_id = _get_secret("WHATSAPP_META_PHONE_ID")
+    if meta_token and meta_phone_id:
+        try:
+            meta_url = f"https://graph.facebook.com/v20.0/{meta_phone_id}/messages"
+            resp = requests.post(
+                meta_url,
+                headers={
+                    "Authorization": f"Bearer {meta_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "messaging_product": "whatsapp",
+                    "to": clean_phone,
+                    "type": "text",
+                    "text": {"preview_url": True, "body": message},
+                },
+                timeout=12,
+            )
+            if resp.ok:
+                print(f"-> WhatsApp enviado via Meta Cloud API para +{clean_phone}!")
+                return {
+                    "sent": True,
+                    "method": "meta_whatsapp",
+                    "detail": f"Enviado automaticamente via WhatsApp Oficial para +{clean_phone}",
+                    "whatsapp_url": wa_link,
+                }
+        except Exception as e:
+            print(f"-> Erro ao enviar via Meta WhatsApp Cloud API: {e}")
+
+    # 3. Tentativa via Webhook/API de WhatsApp (Evolution API / Z-API / Gateway próprio)
+    whatsapp_api_url = _get_secret("WHATSAPP_API_URL")
+    whatsapp_api_token = _get_secret("WHATSAPP_API_TOKEN")
     if whatsapp_api_url:
         try:
             headers = {"Content-Type": "application/json"}
@@ -126,40 +175,36 @@ def send_whatsapp_message(
         except Exception as e:
             print(f"-> Erro ao enviar para Gateway WhatsApp: {e}")
 
-    # 3. Tentativa via Twilio WhatsApp API
-    twilio_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-    twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
-    twilio_from = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886").strip()
-    if twilio_sid and twilio_token:
+    # 4. Tentativa via CallMeBot (caso o usuário tenha chave)
+    api_key = (user_apikey or _get_secret("WHATSAPP_CALLMEBOT_APIKEY")).strip()
+    if api_key:
         try:
-            twilio_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
-            resp = requests.post(
-                twilio_url,
-                data={
-                    "From": twilio_from if twilio_from.startswith("whatsapp:") else f"whatsapp:{twilio_from}",
-                    "To": f"whatsapp:+{clean_phone}",
-                    "Body": message,
+            callmebot_url = "https://api.callmebot.com/whatsapp.php"
+            resp = requests.get(
+                callmebot_url,
+                params={
+                    "phone": f"+{clean_phone}",
+                    "text": message,
+                    "apikey": api_key,
                 },
-                auth=(twilio_sid, twilio_token),
-                timeout=12,
+                timeout=15,
             )
-            if resp.ok:
-                print(f"-> WhatsApp enviado via Twilio para +{clean_phone}!")
+            if resp.status_code == 200 and "error" not in resp.text.lower():
                 return {
                     "sent": True,
-                    "method": "twilio_whatsapp",
-                    "detail": f"Enviado via Twilio WhatsApp para +{clean_phone}",
+                    "method": "whatsapp_api",
+                    "detail": f"Enviado via WhatsApp para +{clean_phone}",
                     "whatsapp_url": wa_link,
                 }
-        except Exception as e:
-            print(f"-> Erro ao enviar via Twilio WhatsApp: {e}")
+        except Exception:
+            pass
 
-    # 4. Modo padrão: Notificação registrada para o número com link direto do WhatsApp
-    print(f"-> Alerta WhatsApp preparado para +{clean_phone}: {wa_link}")
+    # 5. Modo Direto Padrão (Sem precisar de chave externa): Link Direto wa.me para o WhatsApp do usuário
+    print(f"-> Alerta WhatsApp gerado para +{clean_phone}: {wa_link}")
     return {
         "sent": True,
         "method": "whatsapp_direct",
-        "detail": f"Alerta gerado para WhatsApp +{clean_phone}",
+        "detail": f"Alerta WhatsApp pronto para +{clean_phone}",
         "whatsapp_url": wa_link,
     }
 
@@ -193,7 +238,7 @@ def send_notification(
         print(f"📱 Destino WhatsApp: +{normalize_whatsapp_phone(whatsapp_phone)}")
     print("=" * 55 + "\n")
 
-    target_phone = whatsapp_phone or os.getenv("DEFAULT_WHATSAPP_PHONE", "")
+    target_phone = whatsapp_phone or _get_secret("DEFAULT_WHATSAPP_PHONE")
     result = send_whatsapp_message(
         phone=target_phone,
         message=message,
