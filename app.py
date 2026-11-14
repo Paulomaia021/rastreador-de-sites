@@ -62,16 +62,17 @@ if "confirm_delete_id" not in st.session_state:
 if "last_alerts" not in st.session_state:
     st.session_state["last_alerts"] = []
 
-# Persistência de login: recupera a sessão do usuário caso tenha atualizado a página (F5)
-if st.session_state["user"] is None:
-    session_token = st.query_params.get("session_token")
-    if session_token:
-        persisted_user = get_user_from_session_token(session_token)
-        if persisted_user:
-            st.session_state["user"] = persisted_user
-        else:
-            # Token expirado ou inválido: limpa o parâmetro da URL
-            st.query_params.pop("session_token", None)
+# Persistência e controle de sessão: expira após 15 minutos de inatividade
+session_token = st.query_params.get("session_token")
+if session_token:
+    persisted_user = get_user_from_session_token(session_token, renew_minutes=15)
+    if persisted_user:
+        st.session_state["user"] = persisted_user
+    else:
+        # Sessão expirou (mais de 15 minutos inativo) -> realiza logout automático
+        st.query_params.pop("session_token", None)
+        st.session_state["user"] = None
+        st.info("⏱️ Sua sessão expirou após 15 minutos de inatividade. Por favor, entre novamente.")
 
 
 def render_auth_screen() -> None:
